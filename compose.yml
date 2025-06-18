@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    volumes:
+      - .:/code
+      - ./bot.db:/code/bot.db
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/code
