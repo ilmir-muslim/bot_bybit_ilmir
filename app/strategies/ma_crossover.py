@@ -1,5 +1,6 @@
 import time
 import numpy as np
+import pandas as pd
 from typing import Optional
 from app.services.bybit_service import BybitService
 from app.database.engine import SessionLocal
@@ -64,28 +65,31 @@ class MovingAverageStrategy:
         finally:
             db.close()
 
-    def _calculate_atr(self, prices: list[float]) -> float:
-        highs = prices[-self.long_window:]
-        lows = prices[-self.long_window:]
-        closes = prices[-self.long_window:]
-
+    def _calculate_atr(self, candles: list[dict]) -> float:
         trs = []
-        for i in range(1, len(closes)):
-            high = highs[i]
-            low = lows[i]
-            prev_close = closes[i - 1]
+        for i in range(1, len(candles)):
+            high = candles[i]["high"]
+            low = candles[i]["low"]
+            prev_close = candles[i - 1]["close"]
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
             trs.append(tr)
-        return np.mean(trs)
+        return np.mean(trs) if trs else 0.0
 
-    def should_trade(self, prices: list[float]) -> Optional[str]:
-        if len(prices) < self.long_window:
+    def _calculate_ema(self, closes: list[float], window: int) -> float:
+        if len(closes) < window:
+            return sum(closes) / len(closes)
+        series = pd.Series(closes)
+        return series.ewm(span=window, adjust=False).mean().iloc[-1]
+
+    def should_trade(self, candles: list[dict]) -> Optional[str]:
+        if len(candles) < self.long_window:
             return None
 
-        short_ma = np.mean(prices[-self.short_window:])
-        long_ma = np.mean(prices[-self.long_window:])
-        volatility = np.std(prices[-self.long_window:])
-        atr = self._calculate_atr(prices)
+        closes = [c["close"] for c in candles]
+        short_ma = self._calculate_ema(closes, self.short_window)
+        long_ma = self._calculate_ema(closes, self.long_window)
+        volatility = np.std(closes[-self.long_window:])
+        atr = self._calculate_atr(candles)
 
         self.max_loss = min(0.05, max(0.01, volatility * 3))
         self.min_profit_margin = max(0.001, volatility * 2)
@@ -95,12 +99,10 @@ class MovingAverageStrategy:
             print("[ERROR] Нет текущей цены, пропускаем итерацию.")
             return None
         
-        print(f"[DEBUG] short MA: {short_ma:.6f}, long MA: {long_ma:.6f}")
-        print(f'[DEBUG] текущая цена: {current_price}')
+        print(f"[DEBUG] short EMA: {short_ma:.6f}, long EMA: {long_ma:.6f}")
+        print(f"[DEBUG] текущая цена: {current_price}")
         print(f"[DEBUG] Волатильность: {volatility:.6f}, ATR: {atr:.6f}, min_profit_margin: {self.min_profit_margin:.4f}, max_loss: {self.max_loss:.4f}")
 
-
-        # Флэт
         time_since_buy = time.time() - self.last_trade_time
         if (
             self.last_action == "BUY"
@@ -116,7 +118,6 @@ class MovingAverageStrategy:
                     self.ma_crossed_down = False
                     return "SELL"
 
-        # Трейлинг-стоп логика
         if self.last_action == "BUY":
             if self.max_price_since_buy is None:
                 self.max_price_since_buy = current_price
@@ -135,11 +136,10 @@ class MovingAverageStrategy:
                         self.max_price_since_buy = None
                         return "SELL"
 
-        # MA кросс
         if short_ma > long_ma and self.last_action != "BUY":
             self.last_action = "BUY"
             self.last_trade_time = time.time()
-            self.max_price_since_buy = None  # сброс при новом входе
+            self.max_price_since_buy = None
             return "BUY"
 
         elif self.ma_crossed_down and self.last_action == "BUY":

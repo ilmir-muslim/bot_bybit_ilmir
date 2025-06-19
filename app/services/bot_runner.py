@@ -13,8 +13,9 @@ class TradingBot:
 
     def run_once(self):
         try:
-            prices = [item["close"] for item in get_price_history(self.symbol, limit=30)]
-            action = self.strategy.should_trade(prices)
+            candles = get_price_history(self.symbol)
+            action = self.strategy.should_trade(candles)
+
 
             if action == "BUY":
                 usdt_balance = self.bybit.get_balance("USDT")
