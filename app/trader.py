@@ -11,34 +11,44 @@ client = HTTP(testnet=IS_TESTNET, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SE
 bybit = BybitService()
 
 def round_qty(qty: float, precision: int) -> float:
-    """
-    Округляет количество до нужной точности.
-    """
-    quantize_str = "1." + "0" * precision
+    quantize_str = "1" if precision == 0 else "1." + "0" * precision
     return float(Decimal(str(qty)).quantize(Decimal(quantize_str), rounding=ROUND_DOWN))
+
 
 def place_market_order(symbol: str, side: str, qty: float):
     db = SessionLocal()
     try:
-        # Получаем точность количества и округляем
         qty_precision = bybit.get_qty_precision(symbol)
         rounded_qty = round_qty(qty, qty_precision)
 
-        # Отправляем ордер
         response = safe_place_order(bybit.client, symbol, side, str(rounded_qty))
         if not response:
             raise Exception("Ордер не исполнен")
 
         result = response["result"]
         status = result.get("order_status", "UNKNOWN")
+        avg_price = float(result.get("avg_price", 0))
 
-        # Логируем успешную сделку
+        if avg_price == 0:
+            print("[WARN] avg_price == 0, пробуем повторно получить ордер...")
+            order_id = result.get("orderId")
+            if not order_id:
+                raise Exception("Нет orderId для повторной проверки avg_price")
+
+            order_info = bybit.client.get_order(category="spot", orderId=order_id)
+            order_data = order_info["result"]["list"][0]
+            avg_price = float(order_data.get("avgPrice", 0))
+            status = order_data.get("orderStatus", status)
+
+            if avg_price == 0:
+                raise Exception("avg_price всё ещё равен 0 после повторной проверки")
+
         log_trade(
             db=db,
             symbol=symbol,
             side=side,
             qty=rounded_qty,
-            price=float(result.get("avg_price", 0)),
+            price=avg_price,
             status=translate_status(status),
             error=None,
         )
@@ -47,7 +57,6 @@ def place_market_order(symbol: str, side: str, qty: float):
         return result
 
     except Exception as e:
-        # Логируем ошибку
         db.add(
             TradeLog(
                 symbol=symbol,
@@ -84,7 +93,6 @@ def log_trade(db, symbol, side, qty, price, status, error=None):
         error=error,
     )
 
-    # Если это SELL — найдём последний BUY и рассчитаем прибыль
     if side == "SELL":
         last_buy = (
             db.query(TradeLog)
@@ -96,7 +104,7 @@ def log_trade(db, symbol, side, qty, price, status, error=None):
         if last_buy:
             entry_price = last_buy.avg_price
             exit_price = price
-            commission = 0.001 * (entry_price + exit_price) * qty  # 0.1% комиссия x 2 стороны
+            commission = 0.001 * (entry_price + exit_price) * qty
             profit = (exit_price - entry_price) * qty - commission
             profit_pct = ((exit_price - entry_price) / entry_price) * 100
 
@@ -108,7 +116,6 @@ def log_trade(db, symbol, side, qty, price, status, error=None):
             trade.is_profitable = profit > 0
 
     db.add(trade)
-
 
 def get_price_history(symbol: str, limit: int = 50):
     try:

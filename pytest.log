@@ -1,0 +1,8 @@
+06:38:13 - pybit._http_manager - DEBUG - Initializing HTTP session.
+06:38:13 - pybit._http_manager - DEBUG - Initializing HTTP session.
+06:38:13 - pybit._http_manager - DEBUG - Initializing HTTP session.
+06:38:13 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+06:38:14 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/order/history?category=spot&limit=5&symbol=DOGEUSDT HTTP/1.1" 200 None
+06:38:14 - pybit._http_manager - DEBUG - Initializing HTTP session.
+06:38:14 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+06:38:15 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/order/history?category=spot&limit=5&symbol=DOGEUSDT HTTP/1.1" 200 None

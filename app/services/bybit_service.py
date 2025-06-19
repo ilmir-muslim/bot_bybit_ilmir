@@ -2,6 +2,7 @@ from pybit.unified_trading import HTTP
 import requests
 from app.config import BYBIT_API_KEY, BYBIT_API_SECRET, IS_TESTNET
 
+
 class BybitService:
     def __init__(self):
         self.client = HTTP(
@@ -12,6 +13,10 @@ class BybitService:
         try:
             data = self.client.get_tickers(category="spot", symbol=symbol)
             return float(data["result"]["list"][0]["lastPrice"])
+        except Exception as e:
+            print(f"[ERROR] Ошибка получения цены: {e}")
+            return None
+
         except Exception as e:
             print(f"[ERROR] Ошибка получения цены: {e}")
             return None

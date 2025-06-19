@@ -1,8 +1,9 @@
 from app.services.bybit_service import BybitService
-from app.trader import place_market_order, get_price_history
+from app.trader import place_market_order, get_price_history, round_qty
 from app.strategies.ma_crossover import MovingAverageStrategy
 import time
 import traceback
+
 
 class TradingBot:
     def __init__(self, symbol: str):
@@ -18,11 +19,17 @@ class TradingBot:
             if action == "BUY":
                 usdt_balance = self.bybit.get_balance("USDT")
                 price = self.bybit.get_price(self.symbol)
-                if price is None or usdt_balance == 0:
-                    print("[BOT] Невозможно купить: нет цены или нулевой баланс")
+
+                print(f"[DEBUG] USDT баланс: {usdt_balance}")
+
+                if price is None or usdt_balance < 1:
+                    print("[BOT] Пропускаем BUY: нет цены или недостаточно USDT (<1)")
                     return
 
-                qty = round(usdt_balance / price, 4)
+                raw_qty = usdt_balance / price
+                qty_precision = self.bybit.get_qty_precision(self.symbol)
+                qty = round_qty(raw_qty, qty_precision)
+
                 print(f"[BOT] BUY на {qty} {self.symbol}")
                 place_market_order(self.symbol, "Buy", qty)
 
@@ -33,7 +40,9 @@ class TradingBot:
                     print("[BOT] Нечего продавать.")
                     return
 
-                qty = round(balance, 4)
+                qty_precision = self.bybit.get_qty_precision(self.symbol)
+                qty = round_qty(balance, qty_precision)
+
                 print(f"[BOT] SELL на {qty} {self.symbol}")
                 place_market_order(self.symbol, "Sell", qty)
 

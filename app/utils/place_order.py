@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
 
 
@@ -10,7 +10,7 @@ LOG_PATH = "logs/order_failures.json"
 def log_order_failure(context: dict):
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     log_entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         **context
     }
     with open(LOG_PATH, "a", encoding="utf-8") as f:
