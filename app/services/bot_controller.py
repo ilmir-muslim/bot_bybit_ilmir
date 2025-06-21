@@ -1,6 +1,9 @@
 import threading
 import time
+from app.notifier import send_telegram_message
 from app.services.bot_runner import TradingBot
+from app.utils.log_helper import log_maker
+
 
 class BotController:
     def __init__(self):
@@ -29,7 +32,8 @@ class BotController:
                 self.bot.run_once()
                 time.sleep(10)
             except Exception as e:
-                print(f"[ERROR] Bot loop: {e}")
+                log_maker(f"🚨 [ERROR] Ошибка в основном цикле бота:\n{e}")
                 time.sleep(10)
+
 
 bot_controller = BotController()

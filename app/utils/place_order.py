@@ -1,6 +1,8 @@
 import json
 import os
 from datetime import datetime, timezone
+from app.notifier import send_telegram_message
+from app.utils.log_helper import log_maker
 from pybit.unified_trading import HTTP
 
 
@@ -35,14 +37,15 @@ def safe_place_order(
 
     # Попытка №1 — с accountType="SPOT"
     try:
-        print("[TRY] Ордер с accountType='SPOT'")
+        log_maker("🛠️ [TRY] Пробуем ордер с accountType='SPOT'")
         response = client.place_order(**payload, accountType="SPOT")
         if response["retCode"] == 0:
-            print("[SUCCESS] Ордер прошёл с accountType='SPOT'")
+            log_maker("✅ [SUCCESS] Ордер успешно размещён с accountType='SPOT'")
             return response
-        print(f"[FAILURE] retCode: {response['retCode']} — {response['retMsg']}")
+        log_maker(f"❌ [FAILURE] Ошибка размещения ордера: retCode {response['retCode']} — {response['retMsg']}")
     except Exception as e:
-        print(f"[ERROR] ИСКЛЮЧЕНИЕ с accountType='SPOT': {e}")
+        log_maker(f"🚨 [ERROR] Исключение при попытке ордера с accountType='SPOT': {e}")
+
         log_order_failure({
             "symbol": symbol,
             "side": side,
@@ -54,14 +57,14 @@ def safe_place_order(
 
     # Попытка №2 — без accountType
     try:
-        print("[TRY] Ордер без accountType")
+        log_maker("🛠️ [TRY] Пробуем ордер *без* accountType")
         response = client.place_order(**payload)
         if response["retCode"] == 0:
-            print("[SUCCESS] Ордер прошёл без accountType")
+            log_maker("✅ [SUCCESS] Ордер успешно размещён *без* accountType")
             return response
-        print(f"[FAILURE] retCode: {response['retCode']} — {response['retMsg']}")
+        log_maker(f"❌ [FAILURE] Ошибка размещения ордера: retCode {response['retCode']} — {response['retMsg']}")
     except Exception as e:
-        print(f"[ERROR] ИСКЛЮЧЕНИЕ без accountType: {e}")
+        log_maker(f"🚨 [ERROR] Исключение при размещении *без* accountType: {e}")
         log_order_failure({
             "symbol": symbol,
             "side": side,

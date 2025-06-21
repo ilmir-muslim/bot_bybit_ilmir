@@ -1,12 +1,7 @@
-14:46:42 - pybit._http_manager - DEBUG - Initializing HTTP session.
-14:46:42 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
-14:46:44 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/order/history?category=spot&limit=5&symbol=BTCUSDT HTTP/1.1" 200 123
-14:46:44 - pybit._http_manager - DEBUG - Initializing HTTP session.
-14:46:44 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
-14:46:44 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/order/history?category=spot&limit=5&symbol=BTCUSDT HTTP/1.1" 200 123
-14:46:44 - pybit._http_manager - DEBUG - Initializing HTTP session.
-14:46:44 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
-14:46:45 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/order/history?category=spot&limit=5&symbol=BTCUSDT HTTP/1.1" 200 123
-14:46:45 - pybit._http_manager - DEBUG - Initializing HTTP session.
-14:46:45 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
-14:46:46 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/order/history?category=spot&limit=5&symbol=BTCUSDT HTTP/1.1" 200 123
+03:08:58 - pybit._http_manager - DEBUG - Initializing HTTP session.
+03:08:58 - pybit._http_manager - DEBUG - Initializing HTTP session.
+03:08:58 - pybit._http_manager - DEBUG - Initializing HTTP session.
+03:08:58 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+03:08:59 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/order/history?category=spot&limit=5&symbol=XLMUSDT HTTP/1.1" 200 123
+03:08:59 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+03:08:59 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/instruments-info?category=spot&symbol=XLMUSDT HTTP/1.1" 200 498

@@ -12,3 +12,4 @@ def send_telegram_message(message: str):
         response.raise_for_status()
     except Exception as e:
         print(f"[TELEGRAM ERROR] {e}")
+        
