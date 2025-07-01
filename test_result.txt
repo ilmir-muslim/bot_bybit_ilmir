@@ -1,0 +1,93 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.9, pytest-8.4.1, pluggy-1.6.0
+rootdir: /home/ilmir/dev_code/bybit-bot
+configfile: pytest.ini
+plugins: anyio-4.9.0
+collected 2 items
+
+tests/test_coin_selector_real.py::test_real_data_loading 
+-------------------------------- live log setup --------------------------------
+00:37:20 - pybit._http_manager - DEBUG - Initializing HTTP session.
+-------------------------------- live log call ---------------------------------
+00:37:20 - tests.test_coin_selector_real - INFO - 🔄 Тестирование с реальными данными с биржи Bybit...
+00:37:20 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:22 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=BTCUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:22 - tests.test_coin_selector_real - INFO - ✅ BTCUSDT данные получены за 1.23 сек
+00:37:22 - tests.test_coin_selector_real - INFO -   Волатильность: 0.19%
+00:37:22 - tests.test_coin_selector_real - INFO -   Сила тренда: 0.00%
+00:37:22 - tests.test_coin_selector_real - INFO -   Отношение объема: 0.71x
+00:37:22 - tests.test_coin_selector_real - INFO -   Риск/прибыль: 0.24%
+00:37:22 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:23 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=ETHUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:23 - tests.test_coin_selector_real - INFO - ✅ ETHUSDT данные получены за 1.25 сек
+00:37:23 - tests.test_coin_selector_real - INFO -   Волатильность: 0.41%
+00:37:23 - tests.test_coin_selector_real - INFO -   Сила тренда: 0.01%
+00:37:23 - tests.test_coin_selector_real - INFO -   Отношение объема: 1.61x
+00:37:23 - tests.test_coin_selector_real - INFO -   Риск/прибыль: 0.56%
+00:37:23 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:24 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=SOLUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:24 - tests.test_coin_selector_real - INFO - ✅ SOLUSDT данные получены за 1.04 сек
+00:37:24 - tests.test_coin_selector_real - INFO -   Волатильность: 0.49%
+00:37:24 - tests.test_coin_selector_real - INFO -   Сила тренда: -0.00%
+00:37:24 - tests.test_coin_selector_real - INFO -   Отношение объема: 1.37x
+00:37:24 - tests.test_coin_selector_real - INFO -   Риск/прибыль: 0.70%
+00:37:24 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:25 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=ADAUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:25 - tests.test_coin_selector_real - INFO - ✅ ADAUSDT данные получены за 1.20 сек
+00:37:25 - tests.test_coin_selector_real - INFO -   Волатильность: 0.47%
+00:37:25 - tests.test_coin_selector_real - INFO -   Сила тренда: 0.03%
+00:37:25 - tests.test_coin_selector_real - INFO -   Отношение объема: 0.95x
+00:37:25 - tests.test_coin_selector_real - INFO -   Риск/прибыль: 0.57%
+00:37:25 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:26 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=DOGEUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:26 - tests.test_coin_selector_real - INFO - ✅ DOGEUSDT данные получены за 0.97 сек
+00:37:26 - tests.test_coin_selector_real - INFO -   Волатильность: 0.48%
+00:37:26 - tests.test_coin_selector_real - INFO -   Сила тренда: 0.07%
+00:37:26 - tests.test_coin_selector_real - INFO -   Отношение объема: 0.52x
+00:37:26 - tests.test_coin_selector_real - INFO -   Риск/прибыль: 0.62%
+PASSED
+tests/test_coin_selector_real.py::test_real_coin_evaluation 
+-------------------------------- live log call ---------------------------------
+00:37:26 - tests.test_coin_selector_real - INFO - 📊 Оценка монет на реальных данных...
+00:37:26 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:26 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:26 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:26 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:26 - urllib3.connectionpool - DEBUG - Starting new HTTPS connection (1): api.bybit.com:443
+00:37:27 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=BTCUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:27 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=SOLUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:27 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=ETHUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:28 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=DOGEUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:28 - urllib3.connectionpool - DEBUG - https://api.bybit.com:443 "GET /v5/market/kline?category=spot&symbol=ADAUSDT&interval=15&limit=16 HTTP/1.1" 200 None
+00:37:28 - tests.test_coin_selector_real - INFO - ✅ Оценка выполнена за 1.62 сек
+00:37:28 - tests.test_coin_selector_real - INFO - 
+Рейтинг монет:
+00:37:28 - tests.test_coin_selector_real - INFO - 1. ETH: 0.1121
+00:37:28 - tests.test_coin_selector_real - INFO -    Волатильность: 0.40%
+00:37:28 - tests.test_coin_selector_real - INFO -    Сила тренда: 0.01%
+00:37:28 - tests.test_coin_selector_real - INFO -    Отношение объема: 1.61x
+00:37:28 - tests.test_coin_selector_real - INFO -    Риск/прибыль: 0.56%
+00:37:28 - tests.test_coin_selector_real - INFO - 2. SOL: 0.1001
+00:37:28 - tests.test_coin_selector_real - INFO -    Волатильность: 0.49%
+00:37:28 - tests.test_coin_selector_real - INFO -    Сила тренда: -0.00%
+00:37:28 - tests.test_coin_selector_real - INFO -    Отношение объема: 1.37x
+00:37:28 - tests.test_coin_selector_real - INFO -    Риск/прибыль: 0.70%
+00:37:28 - tests.test_coin_selector_real - INFO - 3. ADA: 0.0693
+00:37:28 - tests.test_coin_selector_real - INFO -    Волатильность: 0.47%
+00:37:28 - tests.test_coin_selector_real - INFO -    Сила тренда: 0.03%
+00:37:28 - tests.test_coin_selector_real - INFO -    Отношение объема: 0.95x
+00:37:28 - tests.test_coin_selector_real - INFO -    Риск/прибыль: 0.57%
+00:37:28 - tests.test_coin_selector_real - INFO - 4. BTC: 0.0498
+00:37:28 - tests.test_coin_selector_real - INFO -    Волатильность: 0.19%
+00:37:28 - tests.test_coin_selector_real - INFO -    Сила тренда: 0.00%
+00:37:28 - tests.test_coin_selector_real - INFO -    Отношение объема: 0.71x
+00:37:28 - tests.test_coin_selector_real - INFO -    Риск/прибыль: 0.24%
+00:37:28 - tests.test_coin_selector_real - INFO - 5. DOGE: 0.0431
+00:37:28 - tests.test_coin_selector_real - INFO -    Волатильность: 0.48%
+00:37:28 - tests.test_coin_selector_real - INFO -    Сила тренда: 0.07%
+00:37:28 - tests.test_coin_selector_real - INFO -    Отношение объема: 0.52x
+00:37:28 - tests.test_coin_selector_real - INFO -    Риск/прибыль: 0.62%
+00:37:28 - tests.test_coin_selector_real - INFO - Тест с реальными данными завершен успешно!
+PASSED
+
+============================== 2 passed in 8.88s ===============================

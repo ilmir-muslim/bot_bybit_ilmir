@@ -1,0 +1,4316 @@
+===== ./notifier.py =====
+import requests
+from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_TOKEN_TRADES, TELEGRAM_USER_ID
+
+def send_telegram_message(message: str, buy_sell: bool = False):
+    if buy_sell:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN_TRADES}/sendMessage"
+    else:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_USER_ID,
+        "text": message
+    }
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}")
+        
+
+
+===== ./strategies/neural_network/model.py =====
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+import tensorflow as tf
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+
+class NeuralPredictor:
+    def __init__(
+        self,
+        sequence_length: int = 20,
+        features: int = 5,
+        prediction_steps: int = 3
+    ):
+        self.sequence_length = sequence_length
+        self.features = features
+        self.prediction_steps = prediction_steps
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.model = self.build_model()
+        
+    def build_model(self) -> tf.keras.Model:
+        """Создает LSTM модель для прогнозирования с правильным указанием input_shape"""
+            
+        model = tf.keras.Sequential()
+        
+        # Добавляем Input слой вместо указания input_shape в LSTM
+        model.add(tf.keras.layers.Input(
+            shape=(self.sequence_length, self.features),
+            name="input_layer"
+        ))
+        
+        model.add(tf.keras.layers.LSTM(
+            128, 
+            return_sequences=True,
+            name="lstm_1"
+        ))
+        model.add(tf.keras.layers.Dropout(0.3))
+        model.add(tf.keras.layers.LSTM(
+            64, 
+            return_sequences=False,
+            name="lstm_2"
+        ))
+        model.add(tf.keras.layers.Dropout(0.3))
+        model.add(tf.keras.layers.Dense(32, activation='relu', name="dense_1"))
+        model.add(tf.keras.layers.Dense(self.prediction_steps, name="output"))
+        
+        model.compile(optimizer='adam', loss='mse')
+        return model
+    
+    # Остальные методы без изменений
+    def prepare_data(self, candles):
+        """Подготавливает данные для обучения/прогноза"""
+        data = np.array([
+            [c['open'], c['high'], c['low'], c['close'], c['volume']] 
+            for c in candles
+        ])
+        return self.scaler.fit_transform(data)
+    
+    def train(self, data, epochs=50, batch_size=32):
+        """Обучает модель на исторических данных"""
+        if len(data) < self.sequence_length + self.prediction_steps:
+            raise ValueError("Недостаточно данных для обучения")
+            
+        X, y = [], []
+        for i in range(len(data) - self.sequence_length - self.prediction_steps):
+            X.append(data[i:i+self.sequence_length])
+            y.append(data[i+self.sequence_length:i+self.sequence_length+self.prediction_steps, 3])
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        return self.model.fit(X, y, epochs=epochs, batch_size=batch_size, validation_split=0.1)
+    
+    def predict(self, data):
+        """Делает прогноз на основе последних данных"""
+        # Проверка входных данных
+        if len(data) < self.sequence_length:
+            raise ValueError(f"Недостаточно данных. Требуется: {self.sequence_length}, получено: {len(data)}")
+        
+        # Преобразование данных
+        scaled_data = self.scaler.transform(data)
+        
+        # Подготовка последовательности для прогноза
+        sequence = scaled_data[-self.sequence_length:]
+        sequence = np.array([sequence])  # Добавляем размерность батча
+        
+        # Получение прогноза
+        prediction = self.model.predict(sequence)
+        
+        # Создаем временный массив с правильной структурой для обратного преобразования
+        # Форма: (количество прогнозов, количество признаков)
+        dummy = np.zeros((prediction.shape[1], self.features))
+        
+        # Помещаем прогнозы в столбец закрытия (индекс 3)
+        dummy[:, 3] = prediction[0]
+        
+        # Применяем обратное преобразование
+        unscaled = self.scaler.inverse_transform(dummy)
+        
+        # Возвращаем только прогнозы закрытия
+        return unscaled[:, 3]
+    
+    def save(self, path):
+        """Сохраняет модель в современном формате"""
+        self.model.save(f"{path}.keras")
+        # Сохраняем параметры scaler отдельно
+        np.savez(f"{path}_scaler.npz", scale=self.scaler.scale_, min=self.scaler.min_)
+    
+    def load(self, path):
+        # Убедимся, что путь не содержит лишних расширений
+        base_path = path.replace('.keras', '')
+        
+        model_path = f"{base_path}.keras"
+        scaler_path = f"{base_path}_scaler.npz"
+        
+        if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+            available_files = os.listdir(os.path.dirname(base_path))
+            raise FileNotFoundError(
+                f"Модель или скалер не найдены:\n"
+                f"• {model_path}\n"
+                f"• {scaler_path}\n"
+                f"Доступные файлы: {available_files}"
+            )
+        
+        self.model = tf.keras.models.load_model(model_path)
+        scaler_data = np.load(scaler_path)
+        self.scaler.scale_ = scaler_data['scale']
+        self.scaler.min_ = scaler_data['min']
+
+===== ./strategies/neural_network/trainer.py =====
+import argparse
+import os
+from .model import NeuralPredictor
+
+def main():
+    from app.services.bybit_service import BybitService
+    
+    parser = argparse.ArgumentParser(description='Обучение торговой нейросети')
+    parser.add_argument('--symbol', type=str, default='SOLUSDT', help='Торговый символ')
+    parser.add_argument('--interval', type=str, default='5', help='5-минутный интервал')
+    parser.add_argument('--epochs', type=int, default=200, help='Количество эпох обучения')
+    parser.add_argument('--model_path', type=str, default='models/neural_model.keras', help='Путь для сохранения модели')
+    args = parser.parse_args()
+
+    os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+    
+    bybit = BybitService()
+    candles = bybit.get_candles(args.symbol, args.interval, limit=10000)    
+    
+    # Уменьшили минимальный порог данных
+    if not candles or len(candles) < 180:
+        print(f"❌ Недостаточно данных для обучения ({len(candles) if candles else 0} < 180)")
+        return
+    
+    # Уменьшили длину последовательности
+    predictor = NeuralPredictor(
+        sequence_length=30,  # Было 60
+        prediction_steps=3
+    )
+    data = predictor.prepare_data(candles)
+    predictor.train(data, epochs=args.epochs)
+    
+    model_base_path = args.model_path.replace('.keras', '')
+    predictor.save(model_base_path)
+    print(f"✅ Модель сохранена как: {model_base_path}.keras")
+    
+
+if __name__ == "__main__":
+    main()
+
+===== ./strategies/neural_network/__init__.py =====
+# app/strategies/neural_network/__init__.py
+from .model import NeuralPredictor
+
+
+__all__ = ['NeuralPredictor']
+
+===== ./strategies/neural_strategy.py =====
+import numpy as np
+import time
+from app.strategies.base import Strategy
+from app.strategies.ma_crossover import MovingAverageStrategy
+from app.utils.log_helper import log_maker
+from app.strategies.neural_network.model import NeuralPredictor
+
+class NeuralStrategy(Strategy):
+    def __init__(
+        self, 
+        symbol: str, 
+        bybit_service, 
+        model_path: str = "models/neural_model",
+        base_threshold: float = 0.25,
+        volatility_factor: float = 0.5,
+        rotator=None,
+        trading_system=None,
+        interval: str = "5"
+    ):
+        coin = symbol.replace('USDT', '')
+        self.symbol = symbol
+        self.bybit = bybit_service
+        self.position_coin = coin
+        
+        model_base_path = f"models/{coin}_neural_model"
+        
+        self.base_threshold = base_threshold
+        self.volatility_factor = volatility_factor
+        self.predictor = NeuralPredictor(
+            sequence_length=30,  
+            prediction_steps=3
+        )
+        self.rotator = rotator
+        self.trading_system = trading_system
+        self.interval = interval 
+        
+        try:
+            self.predictor.load(model_base_path)
+            log_maker(f"🧠 Нейросетевая модель загружена из {model_base_path}")
+            log_maker(f"  • Длина последовательности: {self.predictor.sequence_length} свечей")
+            log_maker(f"  • Прогноз на шагов: {self.predictor.prediction_steps}")
+            log_maker(f"  • Базовый порог: {base_threshold:.1f}%, Коэф. волатильности: {volatility_factor}")
+        except Exception as e:
+            log_maker(f"🔥 Критическая ошибка инициализации стратегии: {e}")
+            # Fallback на MA стратегию
+            self.strategy = MovingAverageStrategy(
+                symbol, 
+                "3", 
+                rotator=rotator,
+                trading_system=trading_system
+            )
+        
+        self.min_order_qty = bybit_service.get_min_order_qty(symbol)
+        log_maker(f"  • Минимальный лот: {self.min_order_qty}")
+        self.last_candle_time = 0
+
+    def calculate_volatility(self, candles: list, lookback: int = 20) -> float:
+        ranges = []
+        for i in range(-lookback, 0):
+            candle = candles[i]
+            candle_range = (candle['high'] - candle['low']) / candle['close']
+            ranges.append(candle_range)
+        return np.mean(ranges) * 100
+
+    def should_trade(self, candles: list) -> str:
+        # Убрали фильтр объема свечи
+        # Сохранили проверку конфликта монет
+        current_coin = self.symbol.replace('USDT', '')
+        if current_coin != self.position_coin:
+            log_maker(f"⚠️ Конфликт монет: стратегия {current_coin} vs состояние {self.position_coin}")
+            return None
+            
+        # Проверка минимальной длины данных
+        if len(candles) < self.predictor.sequence_length:
+            log_maker(f"🧠⚠️ Недостаточно данных: {len(candles)} < {self.predictor.sequence_length}")
+            return None
+            
+        try:
+            # Основной блок анализа
+            start_time = time.time()
+            current_price = self.bybit.get_reliable_price(self.symbol)
+            if current_price is None:
+                log_maker("❌ Не удалось получить текущую цену")
+                return None
+                
+            volatility = self.calculate_volatility(candles)
+            adaptive_threshold = self.base_threshold + (volatility * self.volatility_factor)
+            buy_threshold = adaptive_threshold
+            sell_threshold = -adaptive_threshold
+            
+            data = np.array([
+                [c['open'], c['high'], c['low'], c['close'], c['volume']] 
+                for c in candles[-self.predictor.sequence_length:]
+            ])
+            
+            predictions = self.predictor.predict(data)
+            predicted_changes = []
+            prediction_details = []
+            
+            for i, pred_price in enumerate(predictions, 1):
+                change = (pred_price - current_price) / current_price * 100
+                predicted_changes.append(change)
+                prediction_details.append({
+                    "step": i,
+                    "price": pred_price,
+                    "change_pct": change
+                })
+            
+            max_change = max(predicted_changes, key=abs) if predicted_changes else 0
+            signal = None
+            reason = ""
+            
+            if max_change > buy_threshold:
+                signal = "BUY"
+                reason = f"рост +{max_change:.2f}% > порога {buy_threshold:.2f}%"
+            elif max_change < sell_threshold:
+                signal = "SELL"
+                reason = f"падение {max_change:.2f}% < порога {sell_threshold:.2f}%"
+            
+            predictions_str = "\n ".join(
+                [f"{p['step']} шаг: {p['change_pct']:+.2f}%" 
+                for p in prediction_details]
+            )
+            
+            # Формируем лог ВСЕГДА
+            analysis_time = time.time() - start_time
+            log_text = (
+                f"🧠 Анализ {self.symbol} | Цена: {current_price:.4f} | Волатильность: {volatility:.2f}%\n"
+                f"  • Адаптивные пороги: BUY > {buy_threshold:.2f}%, SELL < {sell_threshold:.2f}%\n"
+                f"  • Прогнозы: {predictions_str}\n"
+                f"  • Макс. изменение: {max_change:+.2f}% ({reason})\n"
+                f"  • Решение: {'СИГНАЛ ' + signal if signal else 'НЕТ СИГНАЛА'}\n"
+                f"  • Время анализа: {analysis_time:.2f} сек"
+            )
+            
+            # Проверяем баланс для рекомендаций
+            coin = self.symbol.replace('USDT', '')
+            position_qty = self.bybit.get_balance(coin)
+            
+            # Добавляем рекомендации по пропуску (не блокируем сигнал)
+            if signal == "SELL" and position_qty < self.min_order_qty:
+                log_text += f"\n  • 🧠⏩ Рекомендация: Пропуск SELL (позиция {position_qty} < {self.min_order_qty})"
+                
+            if signal == "BUY" and position_qty >= self.min_order_qty:
+                log_text += f"\n  • 🧠⏩ Рекомендация: Пропуск BUY (уже есть позиция {position_qty})"
+                
+            log_maker(log_text)
+            
+            # Возвращаем сигнал независимо от позиции
+            return signal
+                
+        except Exception as e:
+            log_maker(f"🧠❌ Критическая ошибка нейросети: {str(e)}")
+            import traceback
+            log_maker(f"Трейсбек: {traceback.format_exc()}")
+            return None
+
+    def execute_trade(self, action: str, executor):
+        if action == "BUY":
+            log_maker(f"🧠🟢 Исполняю BUY по {self.symbol}")
+            executor.execute_buy(trading_system=self.trading_system)
+        elif action == "SELL":
+            log_maker(f"🧠🔴 Исполняю SELL по {self.symbol}")
+            executor.execute_sell(strategy=self)
+
+===== ./strategies/base.py =====
+from abc import ABC, abstractmethod
+from typing import Optional
+
+
+class Strategy(ABC):
+    """Базовый интерфейс для торговой стратегии."""
+
+    @abstractmethod
+    def should_trade(self, prices: list[float]) -> Optional[str]:
+        """Решает, стоит ли покупать или продавать.
+        :param prices: список последних цен
+        :return: "BUY", "SELL" или None
+        """
+        pass
+
+
+===== ./strategies/__init__.py =====
+from .ma_crossover import MovingAverageStrategy
+from .neural_strategy import NeuralStrategy
+
+__all__ = ['MovingAverageStrategy', 'NeuralStrategy']
+
+
+===== ./strategies/balance_snapshots.json =====
+{
+    "today": {
+        "balance": 10.57738454,
+        "timestamp": "2025-06-25 00:00:00"
+    },
+    "week": {
+        "balance": 10.059597216,
+        "timestamp": "2025-06-23 00:00:00"
+    },
+    "month": {
+        "balance": 10.059597216,
+        "timestamp": "2025-06-01 00:00:00"
+    },
+    "last_update": "2025-06-25 01:12:42"
+}
+
+===== ./strategies/ma_crossover.py =====
+import time
+import numpy as np
+from typing import List, Dict, Optional
+from app.indicators.market_grades import grade_atr, grade_ema_diff, grade_slope, grade_volatility
+from app.utils.get_profit import ProfitCalculator
+from app.utils.log_helper import log_maker
+from app.services.bybit_service import BybitService
+
+class MovingAverageStrategy:
+    def __init__(
+        self,
+        symbol: str,
+        interval: str = "3",
+        short_window: int = 8,
+        medium_window: int = 21,
+        long_window: int = 50,
+        initial_data_limit: int = 500,
+        rotator=None,  # Для ротатора монет
+        trading_system=None  # Для управления позициями
+    ):
+        self.symbol = symbol
+        self.interval = interval
+        self.short_window = short_window
+        self.medium_window = medium_window
+        self.long_window = long_window
+        self.initial_data_limit = initial_data_limit
+        self.bybit = BybitService()
+        self.rotator = rotator  # Сохраняем ротатор
+        self.trading_system = trading_system  # Сохраняем ссылку на торговую систему
+
+        # Состояние позиции
+        self.position_qty = 0.0
+        self.avg_buy_price = 0.0
+        self.last_action = "NONE"
+        self.max_price_since_buy = None
+        self.last_trade_time = time.time()
+
+        # Статистика эффективности
+        self.trade_opportunities = 0
+        self.executed_trades = 0
+
+        # Инициализация состояния через API
+        self._init_state_from_api()
+
+        # ===== ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ДЛЯ МЕНЕЕ АГРЕССИВНОЙ СТРАТЕГИИ =====
+        # Адаптивные параметры
+        self.adaptive_params = True
+        self.base_min_cross = 0.0005  # Увеличен с 0.0002
+        self.base_min_slope = 0.00001  # Увеличен с 0.000005
+
+        # Риск-менеджмент
+        self.base_min_profit = 0.0080  # Увеличен с 0.0050
+        self.max_loss = 0.0075         # Уменьшен с 0.01
+        self.emergency_stop = -0.006   # Экстренный стоп при -0.6%
+
+        # Фильтры входа
+        self.min_volume_ratio = 0.8    # Увеличен с 0.4
+        self.adaptive_volume_ratio = 0.05  # Увеличен с 0.02
+        self.volume_lookback = 20      # Увеличен с 15
+
+        # Выход из позиции
+        self.trailing_stop_activation = 0.020  # Увеличен с 0.015
+        self.trailing_stop_distance = 0.005    # Уменьшен с 0.006
+
+        # Частичное взятие прибыли (менее агрессивное)
+        self.partial_profit_levels = [0.004, 0.008, 0.012]  # Увеличены
+        self.partial_profit_pcts = [0.2, 0.3, 0.5]          # Уменьшены
+        self.partial_taken = [False, False, False]
+        
+        # Частичный выход при убытках
+        self.partial_exit_level = -0.0025  # Увеличен с -0.003
+        self.partial_exit_pct = 0.3        # Уменьшен с 0.5
+        self.partial_exit_taken = False
+
+        # Защита от преждевременного выхода
+        self.min_hold_time = 30 * 60  # Увеличен с 15 до 30 минут
+
+        # Выход по флэту
+        self.flat_volatility_threshold = 0.0008  # Увеличен с 0.0006
+        self.flat_max_duration = 180
+        self.flat_counter = 0
+        self.flat_max_no_growth = 25  # Увеличено с 15 до 25
+        self.flat_exit_profit = 0.0
+        self.min_hold_time_for_flat = 3600  # Увеличен с 30 до 60 минут
+        
+        # Фильтры по RSI и тренду
+        self.rsi_overbought_threshold = 65  # Уменьшен с 68
+        self.min_risk_reward_ratio = 2.5    # Увеличен с 1.8
+
+        self.min_avg_price = 0.01  # Минимальная допустимая цена покупки
+
+        # Дополнительные фильтры
+        self.require_confirmation = True    # Требовать подтверждение сигнала
+        self.confirmation_period = 3        # Количество свечей для подтверждения
+        self.required_trend_strength = 4    # Минимальная сила тренда для входа
+
+        # ===== КОНЕЦ ПАРАМЕТРОВ =====
+
+        # Технические переменные
+        self.prev_short_ema = None
+        self.prev_medium_ema = None
+        self.prev_long_ema = None
+        self.ma_crossed_down = False
+        self.ema_history = []
+        self.last_trade_price = 0.0
+        self.current_atr = 0.0
+        self.current_short_ema = 0.0
+        self.current_medium_ema = 0.0
+        self.last_candle_time = None
+        self.pending_signal = None
+        self.signal_confirmation_count = 0
+
+        # Загрузка исторических данных
+        self._load_initial_data()
+
+    def _load_initial_data(self):
+        log_maker(
+            f"⏳ Загрузка исторических данных ({self.initial_data_limit} свечей)..."
+        )
+        try:
+            historical_candles = self.bybit.get_candles(
+                self.symbol, interval=self.interval, limit=self.initial_data_limit
+            )
+
+            if historical_candles and len(historical_candles) > 50:
+                closes = [c["close"] for c in historical_candles]
+                self.prev_short_ema = self._calc_ema(closes, self.short_window)
+                self.prev_medium_ema = self._calc_ema(closes, self.medium_window)
+                self.prev_long_ema = self._calc_ema(closes, self.long_window)
+
+                log_maker(
+                    f"📊 Исторические EMA инициализированы:\n"
+                    f"  Short ({self.short_window}): {self.prev_short_ema:.6f}\n"
+                    f"  Medium ({self.medium_window}): {self.prev_medium_ema:.6f}\n"
+                    f"  Long ({self.long_window}): {self.prev_long_ema:.6f}"
+                )
+            else:
+                log_maker(
+                    "⚠️ Не удалось загрузить исторические данные для инициализации EMA"
+                )
+        except Exception as e:
+            log_maker(f"❌ Ошибка загрузки исторических данных: {e}")
+
+    def _init_state_from_api(self):
+        log_maker("\n\n⚙️ Инициализация состояния через API...")
+        try:
+            coin = self.symbol.replace("USDT", "")
+            actual_balance = self.bybit.get_balance(coin)
+            self.position_qty = actual_balance
+
+            # Получаем последние ордера из API
+            orders = self.bybit.get_filled_orders(self.symbol, limit=20)
+            
+            # Если есть ордера, ищем последний BUY
+            last_buy_price = None
+            if orders:
+                for order in orders:
+                    if order["side"].upper() == "BUY":
+                        last_buy_price = float(order.get("avgPrice", 0.0))
+                        break
+            
+            # Если нашли цену покупки
+            if last_buy_price:
+                self.avg_buy_price = last_buy_price
+                log_maker(f"⚙️ Цена покупки установлена: {self.avg_buy_price:.6f}")
+            else:
+                # Если позиция есть, но нет истории покупок
+                if actual_balance > 0:
+                    current_price = self.bybit.get_reliable_price(self.symbol)
+                    self.avg_buy_price = current_price
+                    log_maker(f"⚙️ Установлена текущая цена как цена покупки: {current_price:.6f}")
+                else:
+                    self.avg_buy_price = 0.0
+                    
+        except Exception as e:
+            log_maker(f"❌ Критическая ошибка инициализации из API: {e}")
+            self.position_qty = 0
+            self.avg_buy_price = 0.0
+            
+    def _record_trade(self, side: str):
+        try:
+            order = self.bybit.get_last_filled_order(self.symbol)
+            if not order:
+                log_maker("❌ Не удалось получить данные ордера из API")
+                return
+
+            actual_price = float(order["avg_price"])
+            self.last_trade_price = actual_price
+            actual_qty = float(order["qty"])
+            usdt_qty = float(order["cumExecValue"])
+            coin_qty = float(order["cumExecQty"])
+            actual_side = order["side"].upper()
+
+            # Для покупки
+            if actual_side == "BUY":
+                if self.position_qty > 0:
+                    total_cost = (self.avg_buy_price * self.position_qty) + (
+                        actual_price * actual_qty
+                    )
+                    self.position_qty += actual_qty
+                    self.avg_buy_price = total_cost / self.position_qty
+                else:
+                    self.position_qty = actual_qty
+                    self.avg_buy_price = actual_price
+                
+                # Сброс флагов при новой покупке
+                self.partial_exit_taken = False
+                self.max_price_since_buy = actual_price
+
+            # Для продажи
+            elif actual_side == "SELL":
+                if self.position_qty > 0:
+                    sell_qty = min(actual_qty, self.position_qty)
+                    self.position_qty -= sell_qty
+                    if self.position_qty <= 0:
+                        self.avg_buy_price = 0.0
+                        self.max_price_since_buy = None
+                        # Сброс флагов при полной продаже
+                        self.partial_exit_taken = False
+            
+            # Для частичной продажи
+            elif actual_side == "SELL_PARTIAL":
+                if self.position_qty > 0:
+                    sell_qty = min(actual_qty, self.position_qty)
+                    self.position_qty -= sell_qty
+                    # Не сбрасываем avg_buy_price при частичной продаже
+                    if self.position_qty <= 0:
+                        self.avg_buy_price = 0.0
+                        self.max_price_since_buy = None
+            
+            coin = self.symbol.replace("USDT", "")
+            amount = coin_qty
+            log_maker(
+                f"📝 Сделка записана: {actual_side} {amount} {coin} по цене {actual_price:.6f}. "
+                f"Текущее количество: {self.position_qty:.6f}"
+            )
+        except Exception as e:
+            log_maker(f"❌ Ошибка при записи сделки: {e}")
+            self._init_state_from_api()
+
+    def _calculate_atr(self, candles: List[Dict], window: int = 14) -> float:
+        if len(candles) < 2:
+            return 0.0
+
+        trs = []
+        start_idx = max(1, len(candles) - window)
+
+        for i in range(start_idx, len(candles)):
+            high = candles[i]["high"]
+            low = candles[i]["low"]
+            prev_close = candles[i - 1]["close"]
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            trs.append(tr)
+
+        return np.mean(trs[-window:]) if trs else 0.0
+
+    def _calc_ema(self, prices: List[float], window: int) -> float:
+        if not prices or len(prices) < window:
+            return 0.0
+            
+        k = 2 / (window + 1)
+        ema = prices[0]
+        
+        for price in prices[1:]:
+            ema = price * k + ema * (1 - k)
+            
+        return ema
+
+    def _get_profit_stats(self) -> dict:
+        try:
+            calculator = ProfitCalculator(
+                symbol=self.symbol, bybit=self.bybit, last_action=self.last_action
+            )
+            return calculator.get_profit_stats()
+        except Exception as e:
+            log_maker(f"Ошибка получения статистики прибыли: {e}")
+            return {"today": 0.0, "7_days": 0.0, "30_days": 0.0}
+            
+    def _check_hourly_trend(self) -> int:
+        try:
+            hourly_candles = self.bybit.get_candles(
+                self.symbol, interval="30", limit=8
+            )
+            
+            if len(hourly_candles) < 5:
+                return 0
+                
+            closes = [c["close"] for c in hourly_candles]
+            short_ema = self._calc_ema(closes, 5)
+            medium_ema = self._calc_ema(closes, 10)
+            
+            if short_ema > medium_ema:
+                return 1
+            elif short_ema < medium_ema:
+                return -1
+            return 0
+        except Exception as e:
+            log_maker(f"⚠️ Ошибка проверки часового тренда: {e}")
+            return 0
+
+    def _calculate_rsi(self, closes: List[float], period: int = 14) -> float:
+        if len(closes) < period + 1:
+            return 50.0
+
+        relevant_closes = closes[-(period+1):]
+        deltas = np.diff(relevant_closes)
+        
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains[:period])
+        avg_loss = np.mean(losses[:period])
+        
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period-1) + gains[i]) / period
+            avg_loss = (avg_loss * (period-1) + losses[i]) / period
+        
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+            
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        return min(max(rsi, 0), 100)
+
+    def should_trade(self, candles: List[Dict]) -> Optional[str]:
+        if not candles:
+            return None
+            
+        current_candle = candles[-1]
+        current_candle_time = current_candle.get('timestamp')
+        
+        if not current_candle_time:
+            current_candle_time = time.time()
+        
+        if self.last_candle_time == current_candle_time:
+            return None
+            
+        self.last_candle_time = current_candle_time
+
+        self._init_state_from_api()
+        if not candles:
+            return None
+
+        self.trade_opportunities += 1
+
+        if len(candles) < 50:
+            log_maker(
+                "📊📭 Недостаточно данных для анализа (требуется минимум 50 свечей)"
+            )
+            return None
+
+        current_price = self.bybit.get_price(self.symbol)
+        if not self.bybit.validate_price(current_price, self.symbol):
+            log_maker("🚨 Цена не прошла валидацию! Запрос надежной цены...")
+            current_price = self.bybit.get_reliable_price(self.symbol)
+
+        if current_price is None or not self.bybit.validate_price(
+            current_price, self.symbol
+        ):
+            log_maker("💸❌ Нет достоверной цены, пропускаем итерацию.")
+            return None
+        
+        if (self.position_qty > 0 
+            and self.avg_buy_price < self.min_avg_price
+            and self.last_action == "BUY"):
+            log_maker("⚠️ Критическая ошибка: цена покупки неизвестна! Используем текущую цену.")
+            self.avg_buy_price = current_price
+            self.last_trade_time = time.time()
+
+        candle_low = current_candle['low']
+        price_diff = (current_price - candle_low) / candle_low
+        if not self.position_qty and price_diff > 0.005:
+            log_maker(f"⏩ Пропуск BUY: цена ({current_price}) далеко от минимума свечи ({candle_low})")
+            return None
+
+        closes = [c["close"] for c in candles]
+        volumes = [c.get("volume", 0) for c in candles]
+        if max(volumes[-self.volume_lookback:]) == 0:
+            log_maker("⚠️ Обнаружен нулевой объем, пропускаем итерацию")
+            return None
+
+        range_window = 20
+        upper_level = max(closes[-range_window:])
+        lower_level = min(closes[-range_window:])
+        level_delta = (upper_level - lower_level) * 0.02
+
+        short_ema = self._calc_ema(closes, self.short_window)
+        medium_ema = self._calc_ema(closes, self.medium_window)
+        long_ema = self._calc_ema(closes, self.long_window)
+
+        self.current_short_ema = short_ema
+        self.current_medium_ema = medium_ema
+
+        self.ema_history.append(short_ema)
+        if len(self.ema_history) > 10:
+            self.ema_history.pop(0)
+
+        if len(self.ema_history) >= 3:
+            slopes = []
+            for i in range(1, 3):
+                if self.ema_history[-i - 1] > 0:
+                    slope = (
+                        (self.ema_history[-i] - self.ema_history[-i - 1])
+                        / self.ema_history[-i - 1]
+                    ) * 100
+                    slopes.append(slope)
+            short_ema_slope = np.mean(slopes) if slopes else 0
+        else:
+            short_ema_slope = (
+                ((short_ema - self.prev_short_ema) / self.prev_short_ema) * 100
+                if self.prev_short_ema > 0
+                else 0
+            )
+
+        returns = [np.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+        volatility = np.std(returns[-self.long_window :]) if returns else 0.0
+        volatility_percent = volatility * 100
+
+        volatility_factor = min(5.0, volatility_percent / 0.05) if volatility_percent > 0 else 1.0
+
+        taker_fee = 0.0018
+        min_profit_dynamic = max(
+            self.base_min_profit,
+            taker_fee * 2 + 0.0003,
+            volatility * 1.5,
+        )
+
+        atr = self._calculate_atr(candles, window=14)
+        self.current_atr = atr
+
+        rsi = self._calculate_rsi(closes)
+        if not self.position_qty and rsi > self.rsi_overbought_threshold:
+            log_maker(f"⏩ Пропуск BUY: RSI {rsi:.2f} > {self.rsi_overbought_threshold} (перекупленность)")
+            return None
+
+        if self.adaptive_params:
+            adaptive_cross_diff = max(
+                self.base_min_cross, min(0.01, volatility_factor * self.base_min_cross)
+            )
+            adaptive_ema_slope = max(
+                self.base_min_slope, min(0.005, volatility_factor * self.base_min_slope)
+            )
+            adaptive_volume_ratio = max(
+                0.01,
+                min(1.0, 0.5 / volatility_factor),
+            )
+            
+            if volatility_factor < 0.8:
+                adaptive_cross_diff *= 0.7
+                adaptive_ema_slope *= 0.6
+                adaptive_volume_ratio *= 0.5
+            elif volatility_factor > 1.5:
+                adaptive_cross_diff *= 1.3
+                adaptive_ema_slope *= 1.4
+                adaptive_volume_ratio *= 1.2
+        else:
+            adaptive_cross_diff = self.base_min_cross
+            adaptive_ema_slope = self.base_min_slope
+            adaptive_volume_ratio = 0.3
+
+        qty_precision = self.bybit.get_qty_precision(self.symbol)
+        coin = self.symbol.replace("USDT", "")
+        balance_usdt = self.bybit.get_balance("USDT")
+        quantity_usdt = round(balance_usdt, qty_precision) if balance_usdt else 0
+        time_since_last_trade = (
+            time.time() - self.last_trade_time if self.last_trade_time else 0
+        )
+        hours, remainder = divmod(time_since_last_trade, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        time_display = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+
+        unrealized_pnl = 0.0
+        unrealized_pnl_pct = 0.0
+        position_status = "⚠️ Нет открытой позиции"
+        if self.position_qty > 0:
+            if self.avg_buy_price > 0:
+                api_price = self.bybit.get_reliable_price(self.symbol)
+                unrealized_pnl = (api_price - self.avg_buy_price) * self.position_qty
+                net_profit = unrealized_pnl - api_price * self.position_qty * taker_fee
+                unrealized_pnl_pct = (
+                    net_profit / (self.avg_buy_price * self.position_qty)
+                ) * 100
+
+                if net_profit >= 0:
+                    position_status = (
+                        f"💰 Прибыль: +{net_profit:.6f} USDT (+{unrealized_pnl_pct:.4f}%)"
+                    )
+                else:
+                    position_status = (
+                        f"📉 Убыток: {net_profit:.6f} USDT ({unrealized_pnl_pct:.4f}%)"
+                    )
+            else:
+                position_status = "⚠️ Позиция есть, но цена покупки неизвестна"
+
+        vol_tag, vol_desc = grade_volatility(volatility_percent)
+        atr_tag, atr_desc = grade_atr(atr, current_price)
+        
+        # Динамический стоп-лосс на основе ATR
+        dynamic_stop_loss = self.max_loss
+        if self.position_qty > 0 and self.avg_buy_price > 0:
+            atr_contribution = atr * 2.5 / (self.avg_buy_price * self.position_qty)
+            dynamic_stop_loss = max(self.max_loss, atr_contribution)
+
+        # Принудительный выход по времени
+        if self.last_action == "BUY" and self.position_qty > 0:
+            # Условие 1: если удерживаем больше 1 часа и в убытке
+            if time_since_last_trade > 3600 and unrealized_pnl_pct < 0:
+                log_maker(f"⏱️ [TIME EXIT] Позиция удерживается >1 часа с убытком {unrealized_pnl_pct:.2f}%")
+                return "SELL"
+
+            # Условие 2: если удерживаем больше 30 минут и убыток больше 0.5%
+            if time_since_last_trade > 1800 and unrealized_pnl_pct < -0.5:
+                log_maker(f"🆘 [EMERGENCY EXIT] Позиция удерживается >30 мин с убытком {unrealized_pnl_pct:.2f}%")
+                return "SELL"
+
+            # Экстренный выход при значительном убытке
+            if unrealized_pnl_pct < self.emergency_stop * 100:
+                log_maker(f"🚨 [EMERGENCY STOP] Убыток превысил {self.emergency_stop*100:.2f}%")
+                return "SELL"
+
+        stats_message = (
+            f"📊 short EMA: {short_ema:.6f}\n📊 medium EMA:{medium_ema:.6f}\n📊 long EMA:{long_ema:.6f}\n"
+            f"💰 Текущая цена: {current_price:.6f}\n"
+            f"📦 Баланс {coin}: {self.position_qty:.6f}\n"
+            f"💵 Баланс USDT: {quantity_usdt:.6f}\n"
+            f"{position_status}\n"
+            f"🌪️ Волатильность: {volatility_percent:.4f}% → {vol_tag} ({vol_desc})\n"
+            f"📏 ATR: {atr:.6f} → {atr_tag} ({atr_desc})\n"
+            f"🟢 Min profit: {min_profit_dynamic*100:.4f}% (base: {self.base_min_profit*100:.2f}%) | \n"
+            f"🔴 Max loss: {dynamic_stop_loss*100:.4f}%\n"
+            f"🧭 Последняя операция: {self.last_action} по цене {self.last_trade_price:.6f} USDT\n"
+            f"⏳ Время удержания: {time_display}\n"
+        )
+
+        failed_conditions = []
+
+        # Обновление максимальной цены
+        if self.last_action == "BUY" and self.position_qty > 0:
+            if self.max_price_since_buy is None:
+                self.max_price_since_buy = current_price
+            else:
+                self.max_price_since_buy = max(self.max_price_since_buy, current_price)
+                
+            if current_price > self.max_price_since_buy:
+                self.max_price_since_buy = current_price
+                self.flat_counter = 0
+            else:
+                self.flat_counter += 1
+
+            # Увеличено время для флэт-выхода
+            if (
+                self.flat_counter >= self.flat_max_no_growth
+                and unrealized_pnl_pct > self.flat_exit_profit
+                and time_since_last_trade > self.min_hold_time_for_flat
+            ):
+                log_maker(
+                    f"⏹️ [FLAT EXIT] Цена не растёт {self.flat_counter} свечей, выходим по неубытку ({unrealized_pnl_pct:.2f}%)"
+                )
+                self.flat_counter = 0
+                self.max_price_since_buy = None
+                return "SELL"
+
+        # Выход при флэте с минимальным убытком (с добавлением времени удержания)
+        flat_condition = (
+            self.last_action == "BUY"
+            and volatility < self.flat_volatility_threshold
+            and unrealized_pnl_pct >= -0.1
+            and time_since_last_trade > self.min_hold_time_for_flat
+        )
+        if flat_condition:
+            log_maker(f"📈 Закрываем позицию с прибылью {unrealized_pnl_pct:.4f}%")
+            return "SELL"
+        elif self.last_action == "BUY":
+            if not (volatility < self.flat_volatility_threshold):
+                failed_conditions.append("Волатильность выше порога флэта")
+            if not (unrealized_pnl_pct < 0):
+                failed_conditions.append(
+                    f"Позиция в прибыли ({unrealized_pnl_pct:.4f}%)"
+                )
+
+        if self.last_action == "BUY" and self.position_qty > 0:
+            if self.max_price_since_buy is None:
+                self.max_price_since_buy = current_price
+            elif current_price > self.max_price_since_buy:
+                self.max_price_since_buy = current_price
+
+            if current_price >= self.avg_buy_price * (1 + min_profit_dynamic):
+                trailing_stop_price = self.max_price_since_buy * (
+                    1 - self.trailing_stop_distance
+                )
+                if current_price <= trailing_stop_price:
+                    log_maker(
+                        f"🔐 [TRAILING STOP] Активирован: пик {self.max_price_since_buy:.6f}, текущая {current_price:.6f}"
+                    )
+                    return "SELL"
+                else:
+                    failed_conditions.append(
+                        f"Трейлинг-стоп: цена ({current_price:.6f}) > стопа ({trailing_stop_price:.6f})"
+                    )
+            else:
+                failed_conditions.append(
+                    f"Трейлинг-стоп: не активирован (прибыль < {min_profit_dynamic*100:.4f}%)"
+                )
+
+        stop_loss_condition = (
+            self.last_action == "BUY"
+            and self.position_qty > 0
+            and unrealized_pnl_pct <= -dynamic_stop_loss * 100
+            and time_since_last_trade > 10 * 60
+        )
+        if stop_loss_condition:
+            log_maker(
+                f"🛑 [STOP LOSS] Убыток {unrealized_pnl_pct:.4f}% достиг максимума {-dynamic_stop_loss*100:.4f}%"
+            )
+            return "SELL"
+        elif self.last_action == "BUY" and self.position_qty > 0:
+            failed_conditions.append(
+                f"Стоп-лосс: убыток {unrealized_pnl_pct:.4f}% > порога {-dynamic_stop_loss*100:.4f}%"
+            )
+
+        # Частичный выход при убытках
+        partial_exit_condition = (
+            self.last_action == "BUY"
+            and self.position_qty > 0
+            and unrealized_pnl_pct < self.partial_exit_level * 100
+            and not self.partial_exit_taken
+        )
+
+        if partial_exit_condition:
+            log_maker(f"🟡 [PARTIAL EXIT] Убыток достиг {self.partial_exit_level*100:.2f}%, продаем {self.partial_exit_pct*100:.0f}% позиции")
+            self.partial_exit_taken = True
+            return "SELL_PARTIAL"
+
+        # Проверка подтверждения сигнала
+        if self.pending_signal and self.require_confirmation:
+            self.signal_confirmation_count += 1
+            
+            # Если сигнал подтвержден достаточным количеством свечей
+            if self.signal_confirmation_count >= self.confirmation_period:
+                confirmed_signal = self.pending_signal
+                self.pending_signal = None
+                self.signal_confirmation_count = 0
+                return confirmed_signal
+            else:
+                log_maker(f"⏳ Ожидание подтверждения сигнала ({self.signal_confirmation_count}/{self.confirmation_period})")
+                return None
+
+        if self.prev_short_ema is not None and self.prev_medium_ema is not None:
+            short_medium_diff = (
+                ((short_ema - medium_ema) / medium_ema) * 100 if medium_ema > 0 else 0
+            )
+
+            avg_volume = (
+                np.mean(volumes[-self.volume_lookback :])
+                if len(volumes) >= self.volume_lookback
+                else 0
+            )
+            current_volume = volumes[-1] if volumes else 0
+            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+
+            slope_desc = grade_slope(short_ema_slope)
+            ema_diff_desc = grade_ema_diff(short_medium_diff)
+
+            log_maker(
+                f"📉 EMA Diff: S/M: {short_medium_diff:.4f}% (min: {adaptive_cross_diff:.4f}%) → {ema_diff_desc}\n"
+                f"📐 Наклон short: {short_ema_slope:.4f}% (min: {adaptive_ema_slope:.4f}%) → {slope_desc}\n"
+                f"📊 Объем: {volume_ratio:.2f}x (min: {adaptive_volume_ratio:.2f}x)\n"
+            )
+
+            trend_strength = 0
+            if len(self.ema_history) >= 5:
+                for i in range(1, min(6, len(self.ema_history))):
+                    if (
+                        i < len(self.ema_history)
+                        and self.ema_history[-i] > self.prev_medium_ema
+                    ):
+                        trend_strength += 1
+
+            entry_condition = False
+            entry_type = ""
+            if not entry_condition:
+                if short_ema <= medium_ema:
+                    failed_conditions.append("Short EMA ≤ Medium EMA")
+                elif short_ema_slope <= 0:
+                    failed_conditions.append("Наклон short EMA ≤ 0")
+                elif current_price <= max(c["close"] for c in candles[-6:-1]):
+                    failed_conditions.append("Цена не обновила локальный максимум")
+            if self.prev_short_ema <= self.prev_medium_ema and short_ema > medium_ema:
+                entry_condition = True
+                entry_type = "🆕 Новый восходящий кросс"
+            elif (
+                trend_strength >= self.required_trend_strength
+                and short_ema > medium_ema
+                and short_ema_slope > 0
+                and current_price > max(c["close"] for c in candles[-6:-1])
+            ):
+                entry_condition = True
+                entry_type = "📈 Продолжение сильного тренда"
+
+            if entry_condition:
+                # Дополнительные фильтры входа
+                if short_ema_slope < 0.00015:  # Более строгий фильтр наклона
+                    log_maker("⏩ Пропуск BUY: слабый тренд (наклон EMA < 0.00015)")
+                    return None
+
+                # Проверка объема относительно ATR
+                volume_threshold = atr * 1500  # Увеличен порог
+                if current_volume < volume_threshold:
+                    log_maker(f"⏩ Пропуск BUY: объем {current_volume} < ATR-порога {volume_threshold:.2f}")
+                    return None
+
+                # Проверка силы тренда
+                if trend_strength < self.required_trend_strength:
+                    log_maker(f"⏩ Пропуск BUY: сила тренда {trend_strength} < требуемой {self.required_trend_strength}")
+                    return None
+
+                if self.last_action == "BUY":
+                    volatility_adjustment = max(0.5, min(2.0, volatility_factor))
+                    min_time_since_last_buy = int(self.min_hold_time / volatility_adjustment)
+                    if time_since_last_trade < min_time_since_last_buy:
+                        log_maker(
+                            f"⏱️ Защита: последняя покупка была {time_display} назад, минимальный интервал: {min_time_since_last_buy//60} мин"
+                        )
+                        failed_conditions.append("Защита от частых входов")
+                        entry_condition = False
+
+                condition_cross = short_medium_diff >= adaptive_cross_diff
+                condition_slope = short_ema_slope >= adaptive_ema_slope
+                condition_volume = volume_ratio >= adaptive_volume_ratio
+                conditions_met = sum([condition_cross, condition_slope, condition_volume])
+
+                strong_slope_condition = (
+                    short_ema_slope >= 0.018
+                    and (condition_cross or condition_volume) and
+                    volume_ratio >= 0.08
+                )
+
+                buy_condition = (
+                    balance_usdt >= 5 and
+                    (conditions_met >= 2 or strong_slope_condition)
+                )
+
+                strong_trend = short_ema_slope > 0.015 or volume_ratio > 1.5
+                if buy_condition and current_price > upper_level - level_delta and not strong_trend:
+                    log_maker(
+                        f"⛔ [LEVEL FILTER] Цена {current_price:.2f} близко к верхней границе диапазона ({upper_level:.2f})"
+                    )
+                    failed_conditions.append("Цена близко к верхней границе диапазона")
+                    buy_condition = False
+
+                if buy_condition:
+                    risk = atr * 2
+                    reward = atr * 4
+                    risk_reward_ratio = reward / risk if risk > 0 else 0
+                    
+                    if risk_reward_ratio < self.min_risk_reward_ratio:
+                        log_maker(f"⏩ Пропуск BUY: соотношение риск/прибыль {risk_reward_ratio:.1f} < {self.min_risk_reward_ratio:.1f}")
+                        buy_condition = False
+                        failed_conditions.append(f"Соотношение R/R {risk_reward_ratio:.1f} < {self.min_risk_reward_ratio:.1f}")
+
+                if buy_condition:
+                    hourly_trend = self._check_hourly_trend()
+                    if hourly_trend == -1:
+                        log_maker("⏩ Пропуск BUY: нисходящий тренд на часовом графике")
+                        buy_condition = False
+                        failed_conditions.append("Нисходящий тренд на 1H")
+
+                if buy_condition:
+                    reason = ""
+                    if strong_slope_condition:
+                        reason = "📈 СИЛЬНЫЙ НАКЛОН + дополнительное условие"
+                    elif conditions_met >= 2:
+                        reason = f"✅ {conditions_met} из 3 условий выполнено"
+                    log_maker(f"📥 [BUY SIGNAL] {entry_type} | Причина: {reason}\n"
+                            f"  • Разница EMA: {short_medium_diff:.4f}% {'✅' if condition_cross else '❌'} (порог: {adaptive_cross_diff:.4f}%)\n"
+                            f"  • Наклон EMA: {short_ema_slope:.4f}% {'✅' if condition_slope else '❌'} (порог: {adaptive_ema_slope:.4f}%)\n"
+                            f"  • Объем: {volume_ratio:.2f}x {'✅' if condition_volume else '❌'} (порог: {adaptive_volume_ratio:.2f}x)")
+                    
+                    # Вместо немедленного входа, ставим сигнал на подтверждение
+                    if self.require_confirmation:
+                        self.pending_signal = "BUY"
+                        self.signal_confirmation_count = 1
+                        log_maker(f"🟡 Предварительный сигнал BUY. Ожидаю подтверждения.")
+                        return None
+                    else:
+                        self.max_price_since_buy = current_price
+                        self.ma_crossed_down = False
+                        return "BUY"
+                else:
+                    buy_failed = []
+                    if not (short_medium_diff >= adaptive_cross_diff):
+                        buy_failed.append(
+                            f"Разница EMA S/M ({short_medium_diff:.4f}% < {adaptive_cross_diff:.4f}%)"
+                        )
+                    if not (short_ema_slope >= adaptive_ema_slope):
+                        buy_failed.append(
+                            f"Наклон short EMA ({short_ema_slope:.4f}% < {adaptive_ema_slope:.4f}%)"
+                        )
+                    if not (volume_ratio >= adaptive_volume_ratio):
+                        buy_failed.append(
+                            f"Объем ({volume_ratio:.2f}x < {adaptive_volume_ratio:.2f}x)"
+                        )
+                    if buy_failed:
+                        failed_conditions.append(
+                            f"Условия покупки: " + ", ".join(buy_failed)
+                        )
+
+            if self.prev_short_ema <= self.prev_medium_ema and short_ema > medium_ema:
+                if self.ma_crossed_down:
+                    log_maker("🟢 Сброс флага выхода (MA кросс вверх)")
+                    self.ma_crossed_down = False
+
+            if (
+                self.ma_crossed_down
+                and self.last_action == "BUY"
+                and self.position_qty > 0
+            ):
+                time_in_trade = time.time() - self.last_trade_time
+                if time_in_trade < self.min_hold_time:
+                    log_maker(
+                        f"⏱️ Удерживаем позицию ({time_in_trade/60:.1f} мин < {self.min_hold_time/60} мин)"
+                    )
+                    failed_conditions.append(
+                        f"Защита: позиция удерживается менее {self.min_hold_time/60} мин"
+                    )
+                elif current_price and self.avg_buy_price:
+                    min_net_profit = min_profit_dynamic * 100 + 0.1
+                    if unrealized_pnl_pct >= min_net_profit:
+                        log_maker(
+                            f"💰 [SELL SIGNAL] Net Profit: {unrealized_pnl_pct:.4f}% ≥ {min_net_profit:.4f}%"
+                        )
+                        return "SELL"
+                    elif short_ema > medium_ema:
+                        log_maker("⚠️ Отменяем выход - MA кросс вниз был ложным")
+                        self.ma_crossed_down = False
+                    else:
+                        failed_conditions.append(
+                            f"Выход по флагу: прибыль {unrealized_pnl_pct:.4f}% < мин. {min_net_profit:.4f}%"
+                        )
+                else:
+                    failed_conditions.append("Выход по флагу: нет данных о цене")
+
+            if self.prev_short_ema >= self.prev_medium_ema and short_ema < medium_ema:
+                if self.last_action == "BUY" and self.position_qty > 0:
+                    self.ma_crossed_down = True
+                    log_maker("⚠️ MA cross down - exit flag set")
+                else:
+                    log_maker("⚠️ MA cross down (no position)")
+
+        if (
+            self.position_qty == 0
+            and len(closes) > 8
+            and all(closes[-i] < closes[-i-1] for i in range(7,2,-1))
+            and closes[-2] < closes[-1]
+            and current_price < short_ema * 1.01
+            and current_price < upper_level - level_delta
+            and balance_usdt >= 5
+        ):
+            risk = atr * 2
+            reward = atr * 4
+            risk_reward_ratio = reward / risk if risk > 0 else 0
+            
+            if risk_reward_ratio >= self.min_risk_reward_ratio:
+                # Вход по отскоку также требует подтверждения
+                if self.require_confirmation:
+                    self.pending_signal = "BUY"
+                    self.signal_confirmation_count = 1
+                    log_maker(f"🟡 Предварительный сигнал BOUNCE BUY. Ожидаю подтверждения.")
+                    return None
+                else:
+                    log_maker("📈 [BOUNCE ENTRY] Вход по отскоку после падения")
+                    self.max_price_since_buy = current_price
+                    self.ma_crossed_down = False
+                    return "BUY"
+            else:
+                log_maker(f"⏩ Пропуск BOUNCE: соотношение риск/прибыль {risk_reward_ratio:.1f} < {self.min_risk_reward_ratio:.1f}")
+
+        self.prev_short_ema = short_ema
+        self.prev_medium_ema = medium_ema
+        self.prev_long_ema = long_ema
+
+        log_maker(stats_message)
+
+        if self.trade_opportunities % 50 == 0 and self.trade_opportunities > 0:
+            ratio = self.executed_trades / self.trade_opportunities
+            log_maker(f"📊 Эффективность: {self.executed_trades}/{self.trade_opportunities} ({ratio:.1%}) сигналов исполнено")
+            
+            if ratio < 0.1:
+                self.base_min_cross *= 0.9
+                self.base_min_slope *= 0.85
+                log_maker(f"🔧 Корректировка параметров: min_cross={self.base_min_cross:.6f}, min_slope={self.base_min_slope:.6f}")
+            
+            elif ratio > 0.3:
+                self.base_min_cross *= 1.1
+                self.base_min_slope *= 1.15
+                log_maker(f"🔧 Корректировка параметров: min_cross={self.base_min_cross:.6f}, min_slope={self.base_min_slope:.6f}")
+
+        if failed_conditions:
+            log_maker("🔍 Не выполнены условия:")
+            for condition in failed_conditions:
+                log_maker(f"   - {condition}")
+        else:
+            log_maker("⏸️ Ни одно торговое условие не выполнено")
+
+        return None
+
+    def execute_trade(self, action: str, executor):
+        """Исполнение торгового сигнала с обновлением состояния"""
+        if action == "BUY":
+            # Передаем trading_system в execute_buy
+            if executor.execute_buy(trading_system=self.trading_system):
+                self._init_state_from_api()
+        elif action == "SELL":
+            if executor.execute_sell(strategy=self):
+                self._init_state_from_api()
+
+    
+
+===== ./trader.py =====
+from decimal import ROUND_DOWN, Decimal
+from app.notifier import send_telegram_message
+from app.utils.log_helper import log_maker
+from pybit.unified_trading import HTTP
+from app.services.bybit_service import BybitService
+from app.config import BYBIT_API_KEY, BYBIT_API_SECRET, IS_TESTNET
+
+client = HTTP(
+    testnet=IS_TESTNET,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+    recv_window=15000,
+)
+bybit = BybitService()
+
+
+
+def validate_qty_precision(symbol: str, qty: float):
+    precision = bybit.get_qty_precision(symbol)
+    parts = str(qty).split(".")
+    decimal_digits = len(parts[1]) if len(parts) == 2 else 0
+
+    if decimal_digits > precision:
+        send_telegram_message(
+            f"🚨 [CRITICAL] qty = {qty} содержит {decimal_digits} знаков после запятой, "
+            f"что превышает допустимую точность ({precision}) для {symbol}. "
+            f"Убедись, что используется `round_qty(...)`!"
+        )
+        raise ValueError(
+            f"[CRITICAL] qty={qty} содержит {decimal_digits} знаков после запятой, "
+            f"что превышает допустимую точность ({precision}) для {symbol}. "
+            f"Проверь, что используется round_qty(...)!"
+        )
+
+
+
+def translate_status(status):
+    return {
+        "Filled": "исполнено",
+        "Cancelled": "отменено",
+        "Rejected": "отклонено",
+        "New": "новый",
+        "PartiallyFilled": "частично исполнено",
+    }.get(status, status)
+
+
+
+
+def get_price_history(symbol: str, interval: str = "3", limit: int = 100):
+    """ТОЛЬКО API-данные"""
+    try:
+        return bybit.get_candles(
+            symbol=symbol,
+            interval=interval,  # Используем параметр
+            limit=limit
+        )
+    except Exception as e:
+        log_maker(f"📉 [ERROR] Ошибка получения истории цен: {e}")
+        return []
+
+
+
+===== ./config.py =====
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN_TRADES = os.getenv("TELEGRAM_BOT_TOKEN_TRADES")
+TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
+
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "your_api_key")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "your_api_secret")
+IS_TESTNET = False
+
+symbol = "SOLUSDT"
+
+===== ./trading/order_executor.py =====
+from decimal import ROUND_DOWN, Decimal
+import time
+from app.notifier import send_telegram_message
+from app.utils.log_helper import log_maker
+from pybit.unified_trading import HTTP
+from app.services.bybit_service import BybitService
+from app.config import BYBIT_API_KEY, BYBIT_API_SECRET, IS_TESTNET
+
+client = HTTP(
+    testnet=IS_TESTNET,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+    recv_window=15000,
+)
+bybit = BybitService()
+
+class OrderExecutor:
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.bybit = BybitService()
+        self.last_buy_price = 0.0
+        self.last_buy_quantity = 0.0
+        
+    def execute_force_close(self) -> bool:
+        coin = self.symbol.replace("USDT", "")
+        balance = self.bybit.get_balance(coin)
+        if not balance or balance <= 0:
+            log_maker(f"⏩ Нет позиции для принудительного закрытия {self.symbol}")
+            return False
+            
+        log_maker(f"🆘 [FORCE CLOSE] Продаем {balance} {coin}", buy_sell=True)
+        return self.execute_sell(None)
+        
+    def execute_buy(self, trading_system=None):
+        usdt_balance = self.bybit.get_balance("USDT")
+        if not usdt_balance:
+            log_maker("❌ Не удалось получить баланс USDT")
+            return False
+            
+        usdt_balance = max(0, usdt_balance - 0.1)
+        usdt_balance = round(usdt_balance, 2)
+
+        if usdt_balance < 5:
+            log_maker("⏩ Пропуск BUY: недостаточно средств")
+            return False
+
+        price = self.bybit.get_reliable_price(self.symbol)
+        if not price:
+            log_maker("⏩ Пропуск BUY: не удалось получить цену")
+            return False
+
+        log_maker(f"🟢 [BOT] Покупаем {self.symbol} на {usdt_balance:.2f} USDT", buy_sell=True)
+        order_response = self.bybit.market_order(
+            self.symbol, "Buy", usdt_balance, is_quote=True
+        )
+
+        if order_response and order_response.get("retCode") == 0:
+            log_maker("✅ Ордер на покупку успешно размещен")
+            if trading_system:
+                trading_system.position_open_time = time.time()
+                trading_system.position_coin = self.symbol.replace('USDT', '')
+            
+            filled_order = self.bybit.get_last_filled_order(self.symbol)
+            if filled_order:
+                qty_coin = float(filled_order.get("cumExecQty", 0))
+                avg_price = float(filled_order.get("avg_price", 0))
+                self.last_buy_price = avg_price
+                self.last_buy_quantity = qty_coin
+                
+                if trading_system:
+                    trading_system.position_open_time = time.time()
+                
+                log_maker(
+                    f"✅ Куплено: {qty_coin} {self.symbol.replace('USDT', '')} по {avg_price:.5f} USDT",
+                    buy_sell=True,
+                )
+                return True
+        return False
+
+    def execute_sell(self, strategy=None):
+        coin = self.symbol.replace("USDT", "")
+        balance = self.bybit.get_balance(coin)
+        if not balance:
+            log_maker(f"🤷 Нет позиции по {coin}")
+            return False
+
+        min_qty = self.bybit.get_min_order_qty(self.symbol)
+        if balance < min_qty:
+            log_maker(f"⏩ Пропуск SELL: баланс {balance} < минимального {min_qty}")
+            return False
+
+        log_maker(f"🔻 [BOT] Продаём {balance} {coin}", buy_sell=True)
+        order_response = self.bybit.market_order(
+            self.symbol, "Sell", balance, is_quote=False
+        )
+
+        if order_response and order_response.get("retCode") == 0:
+            log_maker("✅ Ордер на продажу успешно размещен", buy_sell=True)
+            filled_order = self.bybit.get_last_filled_order(self.symbol)
+            if filled_order:
+                qty_coin = float(filled_order.get("cumExecQty", 0))
+                avg_price = float(filled_order.get("avg_price", 0))
+                exec_fee = float(filled_order.get("cumExecFee", 0))
+                
+                profit = 0.0
+                if self.last_buy_price > 0:
+                    buy_value = self.last_buy_price * qty_coin
+                    sell_value = avg_price * qty_coin
+                    profit = sell_value - buy_value - exec_fee
+                    
+                    if hasattr(strategy, "rotator") and strategy.rotator:
+                        strategy.rotator.record_trade_result(profit)
+                    
+                    profit_pct = (profit / buy_value) * 100
+                    profit_msg = (f"🟢 Чистая прибыль: +{profit:.4f} USDT (+{profit_pct:.2f}%)" 
+                                if profit >= 0 else 
+                                f"🔴 Чистый убыток: {profit:.4f} USDT ({profit_pct:.2f}%)")
+                    
+                    log_maker(
+                        f"💰 Продано: {qty_coin} {coin} по {avg_price:.5f} USDT\n"
+                        f"  • {profit_msg}\n"
+                        f"  • Комиссии: {exec_fee:.4f} USDT",
+                        buy_sell=True,
+                    )
+                return True
+        return False
+    
+    def clean_residuals(self, threshold=0.0001):
+        coin = self.symbol.replace('USDT', '')
+        balance = self.bybit.get_balance(coin)
+        if not balance:
+            return
+                
+        min_qty = self.bybit.get_min_order_qty(self.symbol)
+        
+        # Если баланс меньше минимального лота ИЛИ меньше порогового значения
+        if balance < min_qty or balance < threshold:
+            precision = self.bybit.get_qty_precision(self.symbol)
+            # Округляем до допустимой точности
+            qty = round(balance, precision)
+            
+            if qty <= 0:
+                log_maker(f"⏩ Остаток {balance} {coin} слишком мал для продажи")
+                return
+                
+            log_maker(f"🧹 Очистка остатка {qty} {coin}", buy_sell=True)
+            order_response = self.bybit.market_order(
+                self.symbol, "Sell", qty, is_quote=False
+            )
+
+            if order_response and order_response.get("retCode") == 0:
+                log_maker(f"✅ Остаток {qty} {coin} успешно продан", buy_sell=True)
+            else:
+                error = order_response.get("retMsg") if order_response else "Unknown error"
+                log_maker(f"❌ Не удалось продать остаток: {error}", buy_sell=True)
+
+===== ./trading/__init__.py =====
+from .data_provider import DataProvider
+from .order_executor import OrderExecutor
+
+__all__ = ['DataProvider', 'OrderExecutor']
+
+
+===== ./trading/data_provider.py =====
+# ===== ./app/trader/data_provider.py =====
+from app.services.bybit_service import BybitService
+from app.utils.log_helper import log_maker
+
+class DataProvider:
+    def __init__(self, symbol: str, interval: str):
+        self.symbol = symbol
+        self.interval = interval
+        self.bybit = BybitService()
+        self.controller = None
+    
+    def get_candles(self, limit: int = 200):
+        # Используем предзагруженные данные если доступны
+        if self.controller and hasattr(self.controller, 'preloaded_data'):
+            coin = self.symbol.replace('USDT', '')
+            if coin in self.controller.preloaded_data:
+                preloaded = self.controller.preloaded_data[coin]
+                if len(preloaded) >= limit:
+                    return preloaded[-limit:]
+        
+        # Если нет предзагруженных данных, загружаем из API
+        try:
+            candles = self.bybit.get_candles(
+                self.symbol, 
+                interval=self.interval, 
+                limit=limit
+            )
+            
+            if len(candles) < limit // 2:
+                log_maker(f"⚠️ Получено недостаточно свечей: {len(candles)} из {limit}")
+                
+            return candles
+        except Exception as e:
+            log_maker(f"🔥 Ошибка получения данных: {e}")
+            return []
+
+===== ./api/routes/bot_control.py =====
+from fastapi import APIRouter
+from app.services.bot_controller import bot_controller
+
+router = APIRouter()
+
+@router.post("/start")
+def start_bot():
+    bot_controller.start()
+    return {"status": "started"}
+
+@router.post("/stop")
+def stop_bot():
+    bot_controller.stop()
+    return {"status": "stopped"}
+
+@router.get("/status")
+def bot_status():
+    return {"status": bot_controller.status()}
+
+
+===== ./api/routes/trade_log.py =====
+from app.notifier import send_telegram_message
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.database.engine import create_db
+from app.database.models import TradeLog
+
+
+router = APIRouter()
+
+@router.get("/trade")
+def get_trade_log(limit: int = 20, db: Session = Depends(create_db)):
+    try:
+        logs = db.query(TradeLog).order_by(TradeLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                "symbol": log.symbol,
+                "side": log.side,
+                "qty": log.qty,
+                "price": log.avg_price,
+                "status": log.status,
+                "time": log.timestamp.isoformat()
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        send_telegram_message("error in get_trade_log: " + str(e))
+        return {"error": str(e)}
+
+
+===== ./api/routes/__init__.py =====
+
+
+===== ./__init__.py =====
+
+
+===== ./indicators/market_grades.py =====
+# app/indicators/market_grades.py
+
+def grade_volatility(value: float) -> tuple[str, str]:
+    if value < 0.15:
+        return "🔵 Очень низкая", "Флэт, движение отсутствует"
+    elif value < 0.3:
+        return "🟢 Умеренная", "Лёгкое колебание, слабая активность"
+    elif value < 0.6:
+        return "🟡 Средняя", "Умеренная волатильность"
+    else:
+        return "🟠 Высокая", "Сильные колебания, возможны резкие движения цены"
+
+
+def grade_atr(atr: float, current_price: float) -> tuple[str, str]:
+    percent = (atr / current_price) * 100
+    if percent < 0.3:
+        return "🔵 Очень низкий", "Флэт, движение отсутствует"
+    elif percent < 0.7:
+        return "🟡 Средний", "Нормальная активность"
+    else:
+        return "🟠 Высокий", "Рынок дышит широко, высокая амплитуда движения"
+
+
+def grade_slope(value: float) -> str:
+    if value < 0.02:
+        return 'Флэт / стагнация'
+    elif value < 0.08:
+        return 'Слабое движение'
+    elif value < 0.2:
+        return 'Средняя активность'
+    else:
+        return 'Сильное движение'
+
+
+def grade_ema_diff(value: float) -> str:
+    if value < 0.1:
+        return 'Очень слабый тренд'
+    elif value < 0.3:
+        return 'Слабый тренд'
+    elif value < 0.7:
+        return 'Умеренный тренд'
+    else:
+        return 'Сильный тренд'
+
+
+===== ./services/coin_rotator.py =====
+import time
+from typing import List
+import logging
+from app.services.coin_ranker import CoinRanker
+from app.services.coin_selector import CoinSelector
+
+
+class CoinRotator:
+    def __init__(
+        self,
+        initial_coins: List[str],
+        trading_system,  # Ссылка на основную торговую систему
+        rotation_interval: int = 86400,
+        min_trades_for_eval: int = 5,
+        max_inactive_hours: int = 24,
+    ):
+        self.ranker = CoinRanker(min_trades=min_trades_for_eval)
+        self.ranker.add_new_coins(initial_coins)
+        self.selector = CoinSelector(initial_coins)
+        self.rotation_interval = rotation_interval
+        self.max_inactive_hours = max_inactive_hours
+        self.last_rotation = 0
+        self.last_activity_time = time.time()
+        # Убрано дублирующее состояние current_coin - используем trading_system.current_coin
+        self.trading_system = trading_system  # Основная торговая система
+        self.logger = logging.getLogger("coin_rotator")
+        self.logger.info(f"⚙️ Инициализирован ротатор для {initial_coins}")
+
+    def rotate_coins(self):
+        """Основная логика ротации монет"""
+        # Получаем текущую монету из торговой системы
+        previous_coin = self.trading_system.current_coin
+
+        # Проверяем реальные открытые позиции через API
+        open_positions = self.trading_system.bybit.get_open_positions()
+        if open_positions:
+            current_coin = open_positions[0]["coin"]
+            if current_coin != self.trading_system.current_coin:
+                self.logger.warning(
+                    f"⚠️ Обнаружено расхождение: API позиция {current_coin} vs состояние {self.trading_system.current_coin}"
+                )
+                self.trading_system.switch_coin(current_coin)
+            return current_coin  # Возвращаем монету открытой позиции
+
+        current_time = time.time()
+        is_real_rotation = False
+
+        # Проверяем время бездействия
+        inactive_hours = (current_time - self.last_activity_time) / 3600
+        if inactive_hours > self.max_inactive_hours:
+            self.logger.warning(
+                f"🕒 Превышено максимальное время бездействия ({inactive_hours:.1f} > {self.max_inactive_hours} часов)"
+            )
+            is_real_rotation = True
+
+        # Гарантируем ротацию, если монета "застряла"
+        coin_data = self.ranker.data["active_coins"].get(previous_coin)
+        max_selections = 50
+        if coin_data and coin_data.get("selections", 0) > max_selections:
+            self.logger.warning(
+                f"🔄 Принудительная ротация для {previous_coin} (более {max_selections} выборов)"
+            )
+            is_real_rotation = True
+
+        if (
+            current_time - self.last_rotation > self.rotation_interval
+            or is_real_rotation
+        ):
+            # Получаем лучшие монеты из ранкера
+            best_coins = self.ranker.get_best_coins(top_n=5)
+            scores = self.selector.evaluate_coins()
+
+            # Комбинированная оценка монет
+            combined_ranking = {}
+            for coin, score in scores:
+                combined_ranking[coin] = score * 0.7
+            for coin in best_coins:
+                combined_ranking[coin] = combined_ranking.get(coin, 0) + 0.3
+
+            best_coin = max(combined_ranking, key=combined_ranking.get)
+
+            # Сравниваем производительность
+            current_perf = self.ranker.get_coin_performance(previous_coin)
+            new_perf = self.ranker.get_coin_performance(best_coin)
+
+            # Условия ротации
+            should_rotate = (
+                is_real_rotation
+                or new_perf["score"] > current_perf["score"] * 1.5
+                or new_perf["score"] >= current_perf["score"]
+            )
+
+            if should_rotate and (previous_coin != best_coin or is_real_rotation):
+                reason = (
+                    "принудительная ротация"
+                    if inactive_hours > self.max_inactive_hours
+                    or coin_data.get("selections", 0) > max_selections
+                    else "лучшая производительность"
+                )
+                self.logger.info(
+                    f"🔄 Ротация с {previous_coin} на {best_coin} ({reason})"
+                )
+
+                # Обновляем состояние в торговой системе
+                self.trading_system.switch_coin(best_coin)
+                self.last_activity_time = time.time()
+
+                # Фиксируем выбор предыдущей монеты (даже если ротация не реальная, но монета была выбрана)
+                self.ranker.record_selection(
+                    previous_coin, is_real_rotation=is_real_rotation
+                )
+
+                # Фиксируем выбор новой монеты
+                self.ranker.record_selection(
+                    best_coin, is_real_rotation=is_real_rotation
+                )
+
+            else:
+
+                # Фиксируем, что монета была выбрана (даже без ротации)
+                self.ranker.record_selection(previous_coin, is_real_rotation=False)
+                self.logger.info(
+                    f"⏭️ Сохраняем {previous_coin}: новая монета не лучше (текущий: {current_perf['score']:.2f}, новая: {new_perf['score']:.2f})"
+                )
+
+            self.last_rotation = current_time
+
+        return self.trading_system.current_coin
+    
+    def set_current_coin(self, coin: str):
+        """Устанавливает текущую монету для ротации"""
+        if coin in self.selector.coin_list:
+            # Проверяем открытые позиции через API
+            open_positions = self.trading_system.bybit.get_open_positions()
+            if open_positions:
+                current_coin = open_positions[0]['coin']
+                if coin != current_coin:
+                    self.logger.warning(f"⚠️ Конфликт: попытка установить {coin} при открытой позиции по {current_coin}")
+                    return
+                    
+            self.trading_system.current_coin = coin
+            self.last_activity_time = time.time()  # Сбрасываем таймер бездействия
+            self.logger.info(f"⚙️ Установлена текущая монета: {coin}")
+
+    def record_trade_result(self, profit: float):
+        """Фиксирует результат сделки в ранкере"""
+        if self.trading_system.current_coin:
+            self.ranker.record_trade_result(self.trading_system.current_coin, profit)
+            self.last_activity_time = time.time()
+            self.logger.info(
+                f"📊 Записана сделка для {self.trading_system.current_coin}: прибыль = {profit:.4f} USDT"
+            )
+
+    def update_activity(self):
+        """Обновляет время последней активности"""
+        self.last_activity_time = time.time()
+
+
+===== ./services/bybit_sync.py =====
+
+from app.config import BYBIT_API_KEY, BYBIT_API_SECRET, IS_TESTNET
+from pybit.unified_trading import HTTP
+from app.utils.log_helper import log_maker
+
+client = HTTP(
+    testnet=IS_TESTNET,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+    recv_window=15000,
+)
+
+def get_order_history(symbol: str, limit: int = 50):
+    try:
+        response = client.get_order_history(category="spot", symbol=symbol, limit=limit)
+        return response["result"]["list"]
+    except Exception as e:
+        log_maker(f"❌ Ошибка получения истории ордеров: {e}")
+        return []
+
+
+===== ./services/bot_controller.py =====
+import os
+import json
+import time
+import threading
+import logging
+from app.services.bot_runner import TradingBot
+from app.services.bybit_service import BybitService
+from app.strategies import NeuralStrategy, MovingAverageStrategy
+from app.utils.log_helper import log_maker, log_error
+
+class BotController:
+    def __init__(self, strategy_type='neural'):
+        self.thread = None
+        self.strategy_type = strategy_type
+        self._running = threading.Event()
+        self.bybit = BybitService()
+        self.state = self.load_bot_state()
+        
+        # Проверка открытых позиций через API
+        open_positions = self.bybit.get_open_positions()
+        if open_positions:
+            self.symbol = open_positions[0]['symbol']
+            self.position_coin = open_positions[0]['coin']
+            log_maker(f"⚡ Обнаружена открытая позиция: {self.symbol}")
+        else:
+            self.symbol = self._clean_symbol(self.state.get("current_coin", "SOL"))
+            self.position_coin = self.symbol.replace('USDT', '')
+        
+        # Инициализация стратегии
+        self.interval = "5" if strategy_type == 'neural' else "3"
+        self.strategy = self._initialize_strategy()
+        self.bot = TradingBot(
+            strategy=self.strategy,
+            symbol=self.symbol, 
+            interval=self.interval,
+            controller=self
+        )
+        
+        log_maker(f"⚙️ Стратегия: {type(self.strategy).__name__}, интервал: {self.interval} минут")
+        self.save_bot_state()
+
+    def load_bot_state(self) -> dict:
+        """Загружает состояние бота из файла"""
+        try:
+            with open("bot_state.json", "r") as f:
+                return json.load(f)
+        except:
+            return {
+                "current_coin": "SOL",
+                "symbol": "SOLUSDT",
+                "position_coin": "SOL"
+            }
+
+    def _clean_symbol(self, symbol_str: str) -> str:
+        """Форматирование символа"""
+        base = symbol_str.replace('USDT', '')
+        return f"{base}USDT"
+    
+    def _initialize_strategy(self):
+        """Инициализация торговой стратегии"""
+        coin = self.symbol.replace('USDT', '')
+        model_base_path = f"models/{coin}_neural_model"
+        
+        # Выбор между нейросетевой и MA стратегией
+        if self.strategy_type != 'neural':
+            return MovingAverageStrategy(
+                self.symbol, 
+                self.interval,
+                trading_system=self
+            )
+        
+        try:
+            strategy = NeuralStrategy(
+                self.symbol, 
+                bybit_service=self.bybit,
+                model_path=model_base_path,
+                trading_system=self,
+                interval=self.interval
+            )
+            log_maker(f"🧠 Нейросетевая стратегия загружена для {self.symbol}")
+            return strategy
+        except Exception as e:
+            log_error(f"❌ Ошибка инициализации нейросетевой стратегии: {e}")
+            log_maker("🔄 Использую MovingAverage стратегию как fallback")
+            return MovingAverageStrategy(
+                self.symbol, 
+                self.interval,
+                trading_system=self
+            )
+    
+    def save_bot_state(self):
+        """Сохранение состояния системы"""
+        state = {
+            "current_coin": self.position_coin,
+            "symbol": self.symbol,
+            "position_coin": self.position_coin
+        }
+        with open("bot_state.json", "w") as f:
+            json.dump(state, f, indent=2)
+
+    def switch_coin(self, new_coin: str):
+        """Переключение на новую монету"""
+        log_maker(f"🔄 Переключение на {new_coin}")
+        self.position_coin = new_coin
+        self.symbol = f"{new_coin}USDT"
+        
+        # Переинициализация стратегии для новой монеты
+        self.strategy = self._initialize_strategy()
+        
+        # Пересоздание торгового бота
+        self.bot = TradingBot(
+            strategy=self.strategy,
+            symbol=self.symbol,
+            interval=self.interval,
+            controller=self
+        )
+        
+        self.save_bot_state()
+        log_maker(f"✅ Переключено на {new_coin}")
+
+    def start(self):
+        """Запуск торгового бота"""
+        if self.thread and self.thread.is_alive():
+            return
+        self._running.set()
+        self.thread = threading.Thread(target=self._run_bot_loop, daemon=True)
+        self.thread.start()
+        log_maker("▶️ Бот запущен")
+
+    def stop(self):
+        """Остановка торгового бота"""
+        if self.thread:
+            self._running.clear()
+            self.thread.join(timeout=5)
+        log_maker("⏹️ Бот остановлен")
+
+    def status(self):
+        """Статус работы бота"""
+        return "running" if self._running.is_set() else "stopped"
+
+    def _run_bot_loop(self):
+        """Основной цикл работы бота"""
+        while self._running.is_set():
+            try:
+                self.bot.run_once()
+            except Exception as e:
+                log_error(f"🚨 Критическая ошибка в основном цикле: {str(e)}")
+                time.sleep(60)
+
+# Глобальный экземпляр контроллера
+bot_controller = BotController()
+
+===== ./services/bybit_service.py =====
+import os
+import json
+import time
+import traceback
+import requests
+import numpy as np
+import ccxt  # Добавляем импорт CCXT
+
+from pybit.unified_trading import HTTP
+from typing import List, Dict, Optional, Literal
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from app.utils.log_helper import log_maker
+from app.config import IS_TESTNET
+
+
+class BybitService:
+    def __init__(self, api_key=None, api_secret=None):
+        self.session = requests.Session()
+        self.session.timeout = 60
+        self.min_order_cache = {}
+        self.api_key = api_key or os.getenv("BYBIT_API_KEY")
+        self.api_secret = api_secret or os.getenv("BYBIT_API_SECRET")
+        self.recv_window = "5000"
+
+        self.ccxt_exchange = ccxt.bybit(
+            {
+                "apiKey": self.api_key,
+                "secret": self.api_secret,
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+            }
+        )
+
+        self.client = HTTP(
+            testnet=IS_TESTNET,
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            recv_window=15000,
+            timeout=10,
+        )
+
+        retry_strategy = Retry(
+            total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+
+    def get_candles(self, symbol: str, interval: str, limit: int = 100) -> List[Dict]:
+        # Для больших лимитов используем CCXT
+        if limit > 200:
+            return self._get_candles_via_ccxt(symbol, interval, min(limit, 1000))
+
+        cache_key = f"{symbol}_{interval}_{limit}"
+        cache_duration = 60 if interval == "15" else 300
+
+        if hasattr(self, "candle_cache") and cache_key in self.candle_cache:
+            cached = self.candle_cache[cache_key]
+            if time.time() - cached["timestamp"] < cache_duration:
+                return cached["data"]
+
+        limit = min(limit, 100)
+
+        url = "https://api.bybit.com/v5/market/kline"
+        params = {
+            "category": "spot",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+            "simple": "true",
+        }
+
+        for attempt in range(5):
+            try:
+                start_time = time.time()
+                response = self.session.get(url, params=params, timeout=(15, 45))
+
+                duration = time.time() - start_time
+                if duration > 3:
+                    log_maker(
+                        f"⏱️ Запрос {symbol} занял {duration:.2f} сек (попытка {attempt+1})"
+                    )
+
+                if response.status_code != 200:
+                    log_maker(f"📊❌ HTTP {response.status_code} для {symbol}")
+                    # Повторяем попытку для временных ошибок
+                    if response.status_code in [429, 500, 502, 503, 504]:
+                        time.sleep(2**attempt)  # Exponential backoff
+                        continue
+                    return []  # Для других ошибок возвращаем пустой список
+
+                data = response.json()
+
+                if data.get("retCode") != 0:
+                    error_msg = data.get("retMsg", "Unknown error")
+                    log_maker(f"📊❌ API: {error_msg}")
+
+                    # Если это временная ошибка, пробуем снова
+                    if (
+                        "too many requests" in error_msg.lower()
+                        or "service unavailable" in error_msg.lower()
+                    ):
+                        time.sleep(2**attempt)  # Exponential backoff
+                        continue
+                    return []  # Для других ошибок возвращаем пустой список
+
+                candles = []
+                for item in data["result"]["list"]:
+                    try:
+                        candles.append(
+                            {
+                                "timestamp": int(item[0]),
+                                "open": float(item[1]),
+                                "high": float(item[2]),
+                                "low": float(item[3]),
+                                "close": float(item[4]),
+                                "volume": float(item[5]),
+                            }
+                        )
+                    except (ValueError, IndexError) as e:
+                        log_maker(f"📊⚠️ Ошибка парсинга свечи: {e}")
+
+                candles = candles[::-1]
+                if not hasattr(self, "candle_cache"):
+                    self.candle_cache = {}
+                self.candle_cache[cache_key] = {
+                    "data": candles,
+                    "timestamp": time.time(),
+                }
+
+                return candles
+
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ) as e:
+                wait_time = min(2**attempt, 10)
+                log_maker(
+                    f"📊⚠️ Сетевая ошибка ({attempt+1}): {type(e).__name__} - жду {wait_time} сек"
+                )
+                time.sleep(wait_time)
+            except Exception as e:
+                error_type = type(e).__name__
+                log_maker(f"📊🔥 Критическая ошибка ({error_type}): {str(e)}")
+                if attempt == 4:
+                    break
+
+        if hasattr(self, "candle_cache") and cache_key in self.candle_cache:
+            log_maker(f"📊⚠️ Использую кэш для {symbol}")
+            return self.candle_cache[cache_key]["data"]
+
+        log_maker("📊❌ Не удалось получить свечи, возвращаю пустой список")
+        return []
+
+    def _get_candles_via_ccxt(
+        self, symbol: str, interval: str, limit: int
+    ) -> List[Dict]:
+        """Получение свечей через CCXT (до 1000 свечей)"""
+        try:
+            # Преобразование интервалов
+            interval_map = {
+                "1": "1m",
+                "3": "3m",
+                "5": "5m",
+                "15": "15m",
+                "30": "30m",
+                "60": "1h",
+                "120": "2h",
+                "240": "4h",
+                "360": "6h",
+                "720": "12h",
+                "D": "1d",
+                "W": "1w",
+                "M": "1M",
+            }
+            ccxt_interval = interval_map.get(interval, interval)
+
+            log_maker(f"📊 Запрос CCXT: {symbol} {ccxt_interval} x{limit}")
+            ohlcv = self.ccxt_exchange.fetch_ohlcv(symbol, ccxt_interval, limit=limit)
+
+            candles = []
+            for candle in ohlcv:
+                candles.append(
+                    {
+                        "timestamp": candle[0],
+                        "open": candle[1],
+                        "high": candle[2],
+                        "low": candle[3],
+                        "close": candle[4],
+                        "volume": candle[5],
+                    }
+                )
+
+            log_maker(f"📊 Получено {len(candles)} свечей через CCXT")
+            return candles
+        except Exception as e:
+            log_maker(f"🔥 CCXT ошибка получения свечей: {str(e)}")
+            return []
+
+    # Остальные методы остаются без изменений
+    def get_price(self, symbol: str) -> float | None:
+        try:
+            url = "https://api.bybit.com/v5/market/tickers"
+            params = {"category": "spot", "symbol": symbol}
+            response = requests.get(url, params=params, timeout=5)
+            data = response.json()
+            return float(data["result"]["list"][0]["lastPrice"])
+        except Exception as e:
+            log_maker(f"💥 [ERROR] Ошибка получения цены: {e}")
+            return None
+
+    def market_order(
+        self, symbol: str, side: str, quantity: float, is_quote: bool = False
+    ) -> dict:
+        try:
+            params = {
+                "category": "spot",
+                "symbol": symbol,
+                "side": side.capitalize(),
+                "orderType": "Market",
+            }
+
+            if side.lower() == "buy" and is_quote:
+                params["marketUnit"] = "quoteCoin"
+                quantity = round(quantity, 2)
+                params["qty"] = str(quantity)
+            else:
+                params["qty"] = str(quantity)
+
+            response = self.client.place_order(**params)
+            return response
+        except Exception as e:
+            log_maker(f"🚫 [ERROR] Ошибка размещения ордера: {e}")
+            return {}
+
+    def get_balance(self, coin: str, retries: int = 3) -> float:
+        for attempt in range(retries):
+            try:
+                data = self.client.get_wallet_balance(accountType="UNIFIED", coin=coin)
+                coin_info = data["result"]["list"][0]["coin"]
+                for item in coin_info:
+                    if item["coin"] == coin:
+                        # Проверяем и обрабатываем пустые значения
+                        value = item.get("availableToTrade") or \
+                                item.get("availableBalance") or \
+                                item.get("walletBalance")
+                        
+                        # Обрабатываем случаи с пустой строкой
+                        if value == '':
+                            return 0.0
+                        return float(value) if value else 0.0
+                return 0.0
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(1.5 ** attempt)
+                else:
+                    log_maker(f"💰❌ [ERROR] Ошибка получения баланса: {e}")
+        return 0.0
+
+    def get_filled_orders(self, symbol: str, limit: int = 5) -> list[dict]:
+        try:
+            response = self.client.get_order_history(
+                category="spot", symbol=symbol, limit=limit, orderStatus="Filled"
+            )
+            orders = response["result"]["list"]
+
+            return sorted(orders, key=lambda x: int(x["createdTime"]), reverse=True)
+        except Exception as e:
+            log_maker(f"📜❌ [ERROR] Не удалось получить историю ордеров: {e}")
+            return []
+
+    def get_last_filled_price(self, symbol: str) -> float | None:
+        orders = self.get_filled_orders(symbol)
+        if not orders:
+            return None
+        return float(orders[0]["avgPrice"])
+
+    def get_qty_precision(self, symbol: str) -> int:
+        try:
+            url = "https://api.bybit.com/v5/market/instruments-info"
+            params = {"category": "spot", "symbol": symbol}
+            resp = requests.get(url, params=params, timeout=10)
+            data = resp.json()
+            base_precision = data["result"]["list"][0]["lotSizeFilter"]["basePrecision"]
+
+            if "." in base_precision:
+                decimal_part = base_precision.split(".")[1]
+                decimal_places = len(decimal_part.rstrip("0"))
+            else:
+                decimal_places = 0
+
+            return decimal_places
+        except Exception as e:
+            log_maker(f"📏⚠️ [ERROR] Ошибка получения точности количества: {e}")
+            return 4
+
+    def get_price_precision(self, symbol: str) -> int:
+        try:
+            url = "https://api.bybit.com/v5/market/instruments-info"
+            params = {"category": "spot", "symbol": symbol}
+            resp = requests.get(url, params=params, timeout=10)
+            data = resp.json()
+            price_filter = data["result"]["list"][0]["priceFilter"]
+            tick_size = price_filter["tickSize"]
+            decimal_places = len(tick_size.split(".")[-1].rstrip("0"))
+            return decimal_places
+        except Exception as e:
+            log_maker(f"🎯⚠️ [ERROR] Ошибка получения точности цены: {e}")
+            return 4
+
+    def get_order_by_id(self, symbol: str, order_id: str) -> dict | None:
+        try:
+            orders = self.client.get_order_history(category="spot", symbol=symbol)[
+                "result"
+            ]["list"]
+            for order in orders:
+                if order["orderId"] == order_id:
+                    return order
+        except Exception as e:
+            log_maker(f"🆔❌ [ERROR] Не удалось получить ордер по ID: {e}")
+        return None
+
+    def get_last_filled_order(self, symbol: str, limit=1) -> dict:
+        try:
+            response = self.client.get_order_history(
+                category="spot", symbol=symbol, limit=limit, orderStatus="Filled"
+            )
+            with open("last_filled_orders_full.json", "w") as f:
+                json.dump(response, f, indent=2)
+
+            if response["retCode"] != 0:
+                return None
+
+            orders = response["result"]["list"]
+            if not orders:
+                return None
+
+            return {
+                "symbol": orders[0]["symbol"],
+                "side": orders[0]["side"],
+                "qty": orders[0]["qty"],
+                "cumExecValue": orders[0]["cumExecValue"],
+                "cumExecFee": orders[0]["cumExecFee"],
+                "cumExecQty": orders[0]["cumExecQty"],
+                "avg_price": orders[0]["avgPrice"],
+                "timestamp": int(orders[0]["createdTime"]),
+                "order_id": orders[0]["orderId"],
+            }
+        except Exception as e:
+            log_maker(f"🔥 КРИТИЧЕСКАЯ ОШИБКА получения ордера: {e}")
+            return None
+
+    def get_min_order_qty(self, symbol: str) -> float:
+        if symbol in self.min_order_cache:
+            cached = self.min_order_cache[symbol]
+            if time.time() - cached["timestamp"] < 3600:
+                return cached["value"]
+
+        try:
+            url = "https://api.bybit.com/v5/market/instruments-info"
+            params = {"category": "spot", "symbol": symbol}
+            resp = requests.get(url, params=params, timeout=10)
+            data = resp.json()
+
+            # Проверка наличия данных
+            if (
+                not data.get("result")
+                or not data["result"].get("list")
+                or len(data["result"]["list"]) == 0
+            ):
+                return 0.001  # Значение по умолчанию
+
+            min_order_qty = float(
+                data["result"]["list"][0]["lotSizeFilter"]["minOrderQty"]
+            )
+
+            self.min_order_cache[symbol] = {
+                "value": min_order_qty,
+                "timestamp": time.time(),
+            }
+            return min_order_qty
+        except Exception as e:
+            log_maker(f"📏⚠️ [ERROR] Ошибка получения минимального количества: {e}")
+            return 0.001  # Значение по умолчанию
+
+    def validate_price(self, price: float, symbol: str) -> bool:
+        if price is None or price < 0.1 or price > 100000:
+            return False
+
+        current_price = self.get_price(symbol)
+        if current_price is None:
+            return False
+
+        price_diff = abs(price - current_price) / current_price
+        return price_diff < 0.1
+
+    def get_reliable_price(self, symbol: str) -> float:
+        prices = []
+        for _ in range(3):
+            price = self.get_price(symbol)
+            if price:
+                prices.append(price)
+            time.sleep(0.1)
+
+        if not prices:
+            log_maker("🚨 Не удалось получить надежную цену")
+            return 0.0
+
+        return float(np.median(prices))
+
+    def get_best_bid_ask(
+        self, symbol: str
+    ) -> tuple[float | Literal[0], float | Literal[0]] | tuple[Literal[0], Literal[0]]:
+        try:
+            url = "https://api.bybit.com/v5/market/orderbook"
+            params = {"category": "spot", "symbol": symbol, "limit": 1}
+            response = requests.get(url, params=params, timeout=5)
+            data = response.json()
+
+            if data["retCode"] == 0:
+                orderbook = data["result"]
+                best_bid = float(orderbook["b"][0][0]) if orderbook.get("b") else 0
+                best_ask = float(orderbook["a"][0][0]) if orderbook.get("a") else 0
+                return best_bid, best_ask
+        except Exception as e:
+            log_maker(f"📊❌ Ошибка получения стакана: {e}")
+        return 0, 0
+
+    def get_open_positions(self) -> list:
+        try:
+            response = self.client.get_wallet_balance(accountType="UNIFIED")
+            coins = response["result"]["list"][0]["coin"]
+            return [
+                {
+                    'symbol': f"{item['coin']}USDT",
+                    'coin': item['coin'],
+                    'size': float(item['availableToWithdraw']) if item['availableToWithdraw'] != '' else 0.0,
+                    'avg_price': 0.0
+                }
+                for item in coins
+                if float(item['availableToWithdraw'] or 0) > 0 and item['coin'] != 'USDT'
+            ]
+
+        except Exception as e:
+            log_maker(f"🔥 Ошибка получения позиций: {str(e)}")
+            return []
+
+    def get_last_filled_order_for_coin(self, coin: str) -> Optional[dict]:
+        """Получает последний исполненный ордер для монеты через API"""
+        symbol = f"{coin}USDT"
+        try:
+            response = self.client.get_order_history(
+                category="spot", symbol=symbol, limit=1, orderStatus="Filled"
+            )
+
+            if response["retCode"] != 0:
+                return None
+
+            orders = response["result"]["list"]
+            if not orders:
+                return None
+
+            order = orders[0]
+            return {
+                "symbol": order["symbol"],
+                "side": order["side"],
+                "qty": float(order["qty"]),
+                "price": float(order["avgPrice"]),
+                "timestamp": int(order["createdTime"]),
+            }
+        except Exception as e:
+            log_maker(f"🔥 Ошибка получения ордера: {e}")
+            return None
+
+
+===== ./services/bot_runner.py =====
+import time
+import traceback
+from app.trading.data_provider import DataProvider
+from app.trading.order_executor import OrderExecutor
+from app.utils.log_helper import log_maker
+from app.utils.candle_sync import CandleSynchronizer
+
+class TradingBot:
+    def __init__(self, strategy, symbol: str, interval: str, controller=None):
+        self.symbol = symbol
+        self.interval = int(interval)
+        self.strategy = strategy
+        self.controller = controller
+        self.data_provider = DataProvider(symbol, interval)
+        if controller:
+            self.data_provider.controller = controller
+        self.order_executor = OrderExecutor(symbol)
+        self.synchronizer = CandleSynchronizer(self.interval)
+        self._running = False
+        self.first_run = True
+        log_maker(f"🤖 Торговый бот инициализирован для {symbol}")
+        log_maker(f"  • Стратегия: {type(strategy).__name__}")
+        log_maker(f"  • Интервал: {interval} минут")
+        log_maker(f"  • Синхронизация со свечами: включена")
+
+    def run_once(self):
+        start_time = time.time()
+        try:
+            # Обновляем активность ротатора
+            if hasattr(self.strategy, 'rotator'):
+                self.strategy.rotator.update_activity()
+            # Проверяем актуальные позиции через API
+            open_positions = self.order_executor.bybit.get_open_positions()
+            if open_positions:
+                current_coin = open_positions[0]['coin']
+                if current_coin != self.symbol.replace('USDT', ''):
+                    log_maker(f"🔄 Обнаружено расхождение: позиция {current_coin} vs бот {self.symbol}")
+                    self.controller.switch_coin(current_coin)
+                    return  # Пропускаем цикл для переинициализации
+            
+            # Синхронизация со свечами
+            sleep_time = self.synchronizer.time_until_next_candle()
+            max_wait = 60 if self.first_run else 300
+            self.first_run = False
+            
+            if sleep_time > 1:
+                actual_wait = min(sleep_time, max_wait)
+                if actual_wait > 5:
+                    log_maker(f"⏱ Ожидание свечи: {actual_wait:.1f} сек")
+                time.sleep(actual_wait)
+            
+            # Получение балансов
+            coin = self.symbol.replace("USDT", "")
+            usdt_balance = self.order_executor.bybit.get_balance("USDT")
+            coin_balance = self.order_executor.bybit.get_balance(coin)
+            log_maker(f"💰 Баланс: {usdt_balance:.2f} USDT, {coin_balance:.4f} {coin}")
+            
+            # Получение данных
+            candles = self.data_provider.get_candles(limit=100)
+            
+            if not candles or len(candles) < 10:
+                log_maker(f"⛔ Недостаточно данных: {len(candles)} свечей")
+                return
+                
+            # Анализ и торговля
+            action = self.strategy.should_trade(candles)
+            
+            if action:
+                log_maker(f"⚡ Сигнал: {action}")
+                self.strategy.execute_trade(action, self.order_executor)
+                
+        except Exception as e:
+            log_maker(f"💥 Ошибка: {type(e).__name__} - {str(e)}")
+            traceback.print_exc()
+        finally:
+            total_duration = time.time() - start_time
+            log_maker(f"⏱ Цикл завершен за {total_duration:.2f} сек")
+            time.sleep(max(10, self.interval * 60 - total_duration))
+            
+    def start(self):
+        self._running = True
+        log_maker(f"▶️ [BOT] Запущен ({type(self.strategy).__name__} стратегия)")
+        while self._running:
+            self.run_once()
+
+    def stop(self):
+        self._running = False
+        log_maker("⏹️ [BOT] Остановлен")
+
+===== ./services/coin_ranker.py =====
+import os
+import json
+import time
+import numpy as np
+from datetime import datetime, timedelta
+import logging
+from typing import Dict, List, Tuple, Optional
+
+
+class CoinRanker:
+    def __init__(self, data_path: str = "data/coin_ranking.json", min_trades: int = 5):
+        self.data_path = data_path
+        self.min_trades = min_trades
+        self.logger = logging.getLogger("coin_ranker")
+        self.logger.setLevel(logging.INFO)
+
+        # Инициализируем настройки ПЕРЕД загрузкой данных
+        self.default_settings = {
+            "trial_period": 10,
+            "min_success_rate": 0.5,
+            "min_avg_profit": 0.005,
+            "evaluation_period": 30,
+            "initial_boost": 2,
+            "decay_factor": 0.95,
+            "max_coins": 30,
+            "min_trade_density": 0.3,
+        }
+
+        # Теперь загружаем данные
+        self.data = self.load_data()
+
+        # Обновляем настройки
+        if "settings" not in self.data:
+            self.data["settings"] = self.default_settings
+        else:
+            for key, value in self.default_settings.items():
+                if key not in self.data["settings"]:
+                    self.data["settings"][key] = value
+
+        os.makedirs("logs", exist_ok=True)
+
+    def get_best_coins(self, top_n: int = 5) -> List[str]:
+        """Возвращает лучшие монеты по производительности"""
+        ranked = self.get_ranked_coins()
+        return [coin for coin, _ in ranked[:top_n]]
+
+    def load_data(self) -> Dict:
+        """Загружает данные из файла с автоматической коррекцией"""
+        os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
+
+        if os.path.exists(self.data_path):
+            try:
+                with open(self.data_path, "r") as f:
+                    data = json.load(f)
+                    # Добавляем автоматическую миграцию старых данных
+                    self._migrate_old_data(data)
+                    # Применяем коррекцию статистики
+                    self.fix_statistics(data)
+                    return data
+            except Exception as e:
+                self.logger.error(f"Ошибка загрузки данных: {e}")
+                return self._create_initial_data()
+        return self._create_initial_data()
+
+    def _migrate_old_data(self, data: dict):
+        """Конвертирует старые форматы данных в новый формат"""
+        # Миграция для active_coins
+        for coin, coin_data in data.get("active_coins", {}).items():
+            # Конвертация timestamp в ISO строку
+            if "first_selected" in coin_data and isinstance(
+                coin_data["first_selected"], (int, float)
+            ):
+                coin_data["first_selected"] = datetime.fromtimestamp(
+                    coin_data["first_selected"]
+                ).isoformat()
+
+            if "last_selected" in coin_data and isinstance(
+                coin_data["last_selected"], (int, float)
+            ):
+                coin_data["last_selected"] = datetime.fromtimestamp(
+                    coin_data["last_selected"]
+                ).isoformat()
+
+        # Миграция для статистики
+        stats = data.get("statistics", {})
+        if "last_rotation" in stats and isinstance(
+            stats["last_rotation"], (int, float)
+        ):
+            stats["last_rotation"] = datetime.fromtimestamp(
+                stats["last_rotation"]
+            ).isoformat()
+
+        if "created_at" in stats and isinstance(stats["created_at"], (int, float)):
+            stats["created_at"] = datetime.fromtimestamp(
+                stats["created_at"]
+            ).isoformat()
+
+    def fix_statistics(self, data: dict):
+        """Корректирует искаженную статистику selections"""
+        for coin, coin_data in data.get("active_coins", {}).items():
+            try:
+                # Проверяем тип данных для first_selected
+                first_selected = coin_data["first_selected"]
+                if not isinstance(first_selected, str):
+                    # Если это timestamp, конвертируем в строку
+                    if isinstance(first_selected, (int, float)):
+                        coin_data["first_selected"] = datetime.fromtimestamp(
+                            first_selected
+                        ).isoformat()
+                    else:
+                        # Устанавливаем текущую дату как fallback
+                        coin_data["first_selected"] = datetime.now().isoformat()
+                        self.logger.warning(f"🛠️ Исправлено first_selected для {coin}")
+
+                # Проверяем тип данных для last_selected
+                last_selected = coin_data["last_selected"]
+                if not isinstance(last_selected, str):
+                    # Если это timestamp, конвертируем в строку
+                    if isinstance(last_selected, (int, float)):
+                        coin_data["last_selected"] = datetime.fromtimestamp(
+                            last_selected
+                        ).isoformat()
+                    else:
+                        # Устанавливаем текущую дату как fallback
+                        coin_data["last_selected"] = datetime.now().isoformat()
+                        self.logger.warning(f"🛠️ Исправлено last_selected для {coin}")
+
+                # Теперь преобразуем строки в datetime объекты
+                first = datetime.fromisoformat(coin_data["first_selected"])
+                last = datetime.fromisoformat(coin_data["last_selected"])
+                days_active = (last - first).days + 1
+
+                # Ограничиваем selections количеством дней активности
+                if coin_data["selections"] > days_active:
+                    self.logger.info(
+                        f"🛠️ Корректируем selections для {coin}: {coin_data['selections']} -> {days_active}"
+                    )
+                    coin_data["selections"] = days_active
+
+                    # Корректируем trial_used
+                    trial_period = data["settings"]["trial_period"]
+                    coin_data["trial_used"] = min(coin_data["trial_used"], trial_period)
+            except Exception as e:
+                self.logger.error(f"Ошибка коррекции статистики для {coin}: {e}")
+                # Устанавливаем значения по умолчанию при неудачной коррекции
+                coin_data["first_selected"] = datetime.now().isoformat()
+                coin_data["last_selected"] = datetime.now().isoformat()
+                coin_data["selections"] = 1
+                coin_data["trial_used"] = 0
+
+    def _create_initial_data(self) -> Dict:
+        return {
+            "active_coins": {},
+            "archived_coins": {},
+            "statistics": {
+                "total_rotations": 0,
+                "last_rotation": None,
+                "created_at": datetime.now().isoformat(),
+            },
+            "settings": self.default_settings,  # используем self.default_settings
+        }
+
+    def save_data(self):
+        """Сохраняет данные в файл"""
+        try:
+            with open(self.data_path, "w") as f:
+                json.dump(self.data, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Ошибка сохранения данных: {e}")
+
+    def add_new_coin(self, coin: str):
+        """Добавляет новую монету в систему отслеживания"""
+        if coin in self.data["active_coins"] or coin in self.data["archived_coins"]:
+            return
+
+        if len(self.data["active_coins"]) >= self.data["settings"]["max_coins"]:
+            self._remove_lowest_performer()
+
+        self.data["active_coins"][coin] = {
+            "selections": 0,  # Количество выборов (итераций)
+            "trades": 0,  # Количество сделок
+            "profitable_trades": 0,
+            "total_profit": 0.0,
+            "last_selected": None,
+            "first_selected": datetime.now().isoformat(),
+            "last_trade": None,
+            "trial_used": 0,
+            "performance_score": 0.0,
+            "priority": 1.0,  # Начальный приоритет
+        }
+        self.logger.info(f"Добавлена новая монета: {coin}")
+        self.save_data()
+
+    def add_new_coins(self, new_coins: List[str]):
+        """Добавляет несколько новых монет"""
+        for coin in new_coins:
+            self.add_new_coin(coin)
+
+    def record_selection(self, coin: str, is_real_rotation: bool = False):
+        """Фиксирует выбор монеты (итерацию)"""
+        if coin in self.data["active_coins"]:
+            coin_data = self.data["active_coins"][coin]
+            # Увеличиваем selections ВСЕГДА при вызове (независимо от реальной ротации)
+            coin_data["selections"] += 1
+
+            # Уменьшаем "буст" только при реальной ротации
+            if (
+                is_real_rotation
+                and coin_data["trial_used"] < self.data["settings"]["trial_period"]
+            ):
+                coin_data["trial_used"] += 1
+                # Плавное уменьшение приоритета вместо резкого
+                decay = 1.0 - (0.5 / self.data["settings"]["trial_period"])
+                coin_data["priority"] *= decay
+                self.logger.info(
+                    f"🔧 {coin}: уменьшен приоритет (trial {coin_data['trial_used']}/{self.data['settings']['trial_period']})"
+                )
+            coin_data["last_selected"] = datetime.now().isoformat()
+            self.data["statistics"]["total_rotations"] += 1
+            self.data["statistics"]["last_rotation"] = datetime.now().isoformat()
+            self.save_data()
+
+    def record_trade_result(self, coin: str, profit: float):
+        """Записывает результат сделки"""
+        if coin in self.data["active_coins"]:
+            coin_data = self.data["active_coins"][coin]
+            coin_data["trades"] += 1
+            coin_data["last_trade"] = datetime.now().isoformat()
+
+            if profit > 0:
+                coin_data["profitable_trades"] += 1
+
+            coin_data["total_profit"] += profit
+            self.save_data()
+
+            # Пересчитываем оценку производительности
+            self._update_performance_score(coin)
+
+            self.logger.info(f"Записана сделка для {coin}: прибыль={profit:.2f} USDT")
+
+    def _update_performance_score(self, coin: str):
+        """Обновляет оценку производительности монеты с гарантией для новых"""
+        coin_data = self.data["active_coins"][coin]
+        trades = coin_data["trades"]
+        selections = coin_data["selections"]
+
+        # Базовый расчет для монет с историей
+        if trades > 0:
+            success_rate = coin_data["profitable_trades"] / trades
+            avg_profit = coin_data["total_profit"] / trades
+            score = success_rate * avg_profit * 100
+        # Новые монеты без истории сделок
+        else:
+            # Минимальный стартовый балл вместо 0
+            score = 0.5
+
+            # Дополнительный буст для совершенно новых монет
+            if coin_data["selections"] == 0:
+                score += 1.0
+
+        # Применяем буст для новых монет
+        trial_period = self.data["settings"]["trial_period"]
+        if coin_data["trial_used"] < trial_period:
+            # Сохраняем более сильный буст на весь испытательный период
+            boost = self.data["settings"]["initial_boost"]
+            score *= boost
+
+            # Дополнительный буст для первых 3 выборов
+            if coin_data["selections"] < 3:
+                score *= 1.5
+
+        coin_data["performance_score"] = max(0.1, score)  # Никогда не опускаем ниже 0.1
+        self.save_data()
+
+    def get_coin_performance(self, coin: str) -> Dict:
+        """Возвращает производительность монеты"""
+        if coin not in self.data["active_coins"]:
+            return {"status": "unknown", "score": 0, "priority": 0}
+
+        coin_data = self.data["active_coins"][coin]
+        return {
+            "status": self._get_performance_status(coin_data),
+            "score": coin_data["performance_score"],
+            "priority": coin_data["priority"],
+            "trades": coin_data["trades"],
+            "selections": coin_data["selections"],
+            "trade_density": (
+                coin_data["trades"] / coin_data["selections"]
+                if coin_data["selections"] > 0
+                else 0
+            ),
+            "success_rate": (
+                coin_data["profitable_trades"] / coin_data["trades"]
+                if coin_data["trades"] > 0
+                else 0
+            ),
+            "avg_profit": (
+                coin_data["total_profit"] / coin_data["trades"]
+                if coin_data["trades"] > 0
+                else 0
+            ),
+        }
+
+    def _get_performance_status(self, coin_data: Dict) -> str:
+        """Определяет статус производительности"""
+        trades = coin_data["trades"]
+
+        if trades == 0:
+            return "untested"
+
+        if coin_data["trial_used"] < self.data["settings"]["trial_period"]:
+            return "trial"
+
+        success_rate = coin_data["profitable_trades"] / trades
+        avg_profit = coin_data["total_profit"] / trades
+
+        if (
+            success_rate >= 0.7
+            and avg_profit >= self.data["settings"]["min_avg_profit"]
+        ):
+            return "excellent"
+        elif (
+            success_rate >= 0.6
+            and avg_profit >= self.data["settings"]["min_avg_profit"] * 0.8
+        ):
+            return "good"
+        elif success_rate >= 0.5:
+            return "neutral"
+        else:
+            return "poor"
+
+    def get_ranked_coins(self) -> List[Tuple[str, float]]:
+        """Возвращает отсортированный список монет по приоритету"""
+        ranked = []
+        for coin, data in self.data["active_coins"].items():
+            # Комбинированный рейтинг = производительность * приоритет
+            score = data["performance_score"] * data["priority"]
+            ranked.append((coin, score))
+
+        # Сортируем по убыванию рейтинга
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return ranked
+
+    def should_keep_coin(self, coin: str) -> bool:
+        """Определяет, стоит ли сохранять монету"""
+        perf = self.get_coin_performance(coin)
+        return perf["status"] in ["excellent", "good", "trial"]
+
+    def evaluate_and_cleanup(self):
+        """Оценивает и очищает список монет, удаляя неэффективные"""
+        coins_to_remove = []
+
+        for coin, data in list(self.data["active_coins"].items()):
+            # Удаляем монеты с плохой производительностью после испытательного срока
+            if data["trial_used"] >= self.data["settings"]["trial_period"]:
+                perf_status = self._get_performance_status(data)
+                if perf_status == "poor":
+                    coins_to_remove.append(coin)
+
+            # Удаляем монеты, которые не выбирались долгое время
+            if data["last_selected"]:
+                last_selected = datetime.fromisoformat(data["last_selected"])
+                if (datetime.now() - last_selected) > timedelta(days=30):
+                    coins_to_remove.append(coin)
+
+        for coin in coins_to_remove:
+            self.logger.info(
+                f"Удаление монеты {coin} из-за плохой производительности или неактивности"
+            )
+            self.data["archived_coins"][coin] = self.data["active_coins"].pop(coin)
+
+        if coins_to_remove:
+            self.save_data()
+
+    def get_next_coin(self, current_coin: str) -> str:
+        """Возвращает следующую монету для торговли"""
+        ranked_coins = self.get_ranked_coins()
+
+        # Если текущая монета в топе, сохраняем ее
+        if ranked_coins and current_coin == ranked_coins[0][0]:
+            return current_coin
+
+        # Ищем следующую подходящую монету
+        for coin, score in ranked_coins:
+            if coin == current_coin:
+                continue
+
+            perf = self.get_coin_performance(coin)
+            if perf["status"] not in ["poor", "unknown"]:
+                return coin
+
+        # Если ничего не найдено, возвращаем текущую монету
+        return current_coin
+
+    def _remove_lowest_performer(self):
+        """Удаляет монету с самой низкой производительностью"""
+        ranked = self.get_ranked_coins()
+        if not ranked:
+            return
+
+        lowest_coin = ranked[-1][0]
+        self.logger.info(
+            f"Удаление самой слабой монеты {lowest_coin} для освобождения места"
+        )
+        self.data["archived_coins"][lowest_coin] = self.data["active_coins"].pop(
+            lowest_coin
+        )
+        self.save_data()
+
+    def generate_report(self) -> str:
+        """Генерирует отчет о состоянии системы"""
+        report = [
+            "📊 Coin Ranking System Report",
+            f"• Всего ротаций: {self.data['statistics']['total_rotations']}",
+            f"• Активных монет: {len(self.data['active_coins'])}",
+            f"• В архиве: {len(self.data['archived_coins'])}",
+            f"• Система создана: {self.data['statistics']['created_at']}",
+            f"• Последняя ротация: {self.data['statistics']['last_rotation'] or 'N/A'}",
+            "",
+            "⚙️ Настройки системы:",
+        ]
+
+        for key, value in self.data["settings"].items():
+            report.append(f"  • {key}: {value}")
+
+        report.append("\n🏆 Топ-5 монет:")
+        ranked = self.get_ranked_coins()[:5]
+
+        for i, (coin, score) in enumerate(ranked, 1):
+            perf = self.get_coin_performance(coin)
+            report.append(
+                f"{i}. {coin}: "
+                f"score={score:.2f}, "
+                f"status={perf['status']}, "
+                f"priority={perf['priority']:.2f}, "
+                f"trades={perf['trades']}, "
+                f"success={perf['success_rate']:.1%}"
+            )
+
+        return "\n".join(report)
+
+
+===== ./services/model_trainer.py =====
+# services/model_trainer.py
+import threading
+import sys
+import os
+import time
+from app.utils.log_helper import log_maker
+import traceback
+import logging
+import json
+
+# Импорт функции обучения модели
+try:
+    from app.strategies.neural_network.trainer import main as train_model
+except ImportError:
+    log_maker("❌ Ошибка импорта функции обучения модели. Проверьте путь к модулю.")
+    train_model = None
+
+
+class ModelTrainer:
+    def __init__(self, coin_list, interval="5", epochs=100, max_concurrent=1):
+        self.coin_list = coin_list
+        self.interval = interval  # Сохраняем текущий интервал
+        self.epochs = epochs
+        self.max_concurrent = max_concurrent
+        self.training_queue = []
+        self.current_training = 0
+        self.thread = threading.Thread(target=self._training_loop, daemon=True)
+        self.thread.start()
+        self.logger = logging.getLogger("model_trainer")
+        self.logger.setLevel(logging.INFO)
+        log_maker(
+            f"🎓 Инициализирован тренер моделей. Интервал: {interval} мин. Макс. одновременных обучений: {max_concurrent}"
+        )
+
+        # Создаем директорию для моделей
+        os.makedirs("models", exist_ok=True)
+
+    def add_to_queue(self, coin, force_retrain=False):
+        """Добавляет монету в очередь на обучение"""
+        model_path = f"models/{coin}_neural_model"
+        model_file = f"{model_path}.keras"
+        error_path = f"{model_path}.error"
+        config_path = f"{model_path}.config"
+
+        if os.path.exists(model_file) and not force_retrain:
+            return False
+
+        # Проверяем конфигурацию существующей модели
+        existing_interval = self._get_model_interval(config_path)
+        interval_mismatch = (
+            existing_interval != self.interval if existing_interval else False
+        )
+
+        # Причины для переобучения
+        reasons = []
+        if force_retrain:
+            reasons.append("принудительное переобучение")
+        if interval_mismatch:
+            reasons.append(
+                f"несоответствие интервала ({existing_interval} ≠ {self.interval})"
+            )
+        if not os.path.exists(model_file):
+            reasons.append("модель не существует")
+        if os.path.exists(error_path):
+            reasons.append("предыдущая ошибка обучения")
+
+        if reasons:
+            reason_str = ", ".join(reasons)
+            self.logger.info(f"🧠 Требуется обучение {coin}: {reason_str}")
+
+            # Удаляем старые файлы если нужно
+            if os.path.exists(model_file):
+                try:
+                    os.remove(model_file)
+                    os.remove(f"{model_path}_scaler.npz")
+                    self.logger.info(f"🧹 Удалены старые файлы модели для {coin}")
+                except Exception as e:
+                    self.logger.info(f"⚠️ Ошибка удаления старых файлов: {e}")
+
+            # Добавляем в очередь, если еще не добавлена
+            if coin not in self.training_queue:
+                # Новые монеты (без модели) добавляем в начало очереди
+                if not os.path.exists(model_file) and not os.path.exists(error_path):
+                    self.training_queue.insert(0, coin)
+                    self.logger.info(
+                        f"🚀 Монета {coin} (новая) добавлена в начало очереди обучения"
+                    )
+                else:
+                    self.training_queue.append(coin)
+                    self.logger.info(
+                        f"🧠 Монета {coin} добавлена в очередь на обучение"
+                    )
+
+            else:
+                self.logger.info(f"🧠 Монета {coin} уже в очереди на обучение")
+            return True
+        else:
+            self.logger.info(
+                f"🧠 Модель для {coin} актуальна (интервал: {self.interval} мин)"
+            )
+            return False
+
+    def _get_model_interval(self, config_path):
+        """Получает интервал из конфигурации модели"""
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    return config.get("interval")
+            except:
+                return None
+        return None
+
+    def _save_model_config(self, config_path, interval):
+        """Сохраняет конфигурацию модели"""
+        try:
+            with open(config_path, "w") as f:
+                json.dump({"interval": interval}, f)
+        except Exception as e:
+            log_maker(f"⚠️ Ошибка сохранения конфигурации модели: {e}")
+
+    def start_periodic_retraining(self, interval_hours=24):
+        """Запускает периодическое переобучение каждые N часов"""
+
+        def retrain_loop():
+            while True:
+                time.sleep(interval_hours * 3600)
+                self.logger.info(
+                    f"🔄 Запуск периодического переобучения моделей (интервал: {self.interval} мин)"
+                )
+                for coin in self.coin_list:
+                    self.add_to_queue(coin, force_retrain=True)
+
+        threading.Thread(target=retrain_loop, daemon=True).start()
+
+    def _training_loop(self):
+        """Основной цикл обработки очереди обучения"""
+        while True:
+            try:
+                # Проверяем возможность запуска нового обучения
+                if self.training_queue and self.current_training < self.max_concurrent:
+
+                    coin = self.training_queue.pop(0)
+                    self.current_training += 1
+
+                    # Запускаем обучение в отдельном потоке
+                    threading.Thread(
+                        target=self._train_coin_model, args=(coin,), daemon=True
+                    ).start()
+
+                time.sleep(10)  # Проверяем очередь каждые 10 секунд
+            except Exception as e:
+                log_maker(f"🔥 Ошибка в цикле обучения: {str(e)}")
+                traceback.print_exc()
+                time.sleep(30)
+
+    def _train_coin_model(self, coin):
+        """Обучает модель для конкретной монеты"""
+        symbol = f"{coin}USDT"
+        model_path = f"models/{coin}_neural_model"
+        config_path = f"{model_path}.config"
+
+        try:
+            log_maker(f"🧠 Начинаю обучение модели для {symbol} ({self.interval} мин)")
+
+            # Проверяем наличие функции обучения
+            if train_model is None:
+                raise ImportError("Функция обучения не найдена")
+
+            # Создаем аргументы командной строки для обучения
+            original_argv = sys.argv.copy()
+            sys.argv = [
+                "trainer.py",
+                f"--symbol={symbol}",
+                f"--interval={self.interval}",  # Используем текущий интервал
+                f"--epochs={str(self.epochs)}",
+                f"--model_path={model_path}",
+            ]
+
+            log_maker(f"🔧 Параметры обучения: {' '.join(sys.argv[1:])}")
+
+            # Вызываем функцию обучения
+            train_model()
+
+            # Сохраняем конфигурацию модели
+            self._save_model_config(config_path, self.interval)
+
+            log_maker(
+                f"✅ Модель для {symbol} ({self.interval} мин) успешно обучена и сохранена"
+            )
+
+        except Exception as e:
+            error_msg = f"❌ Ошибка обучения модели для {symbol} ({self.interval} мин): {str(e)}"
+            log_maker(error_msg)
+            traceback.print_exc()
+
+            # Создаем файл ошибки
+            try:
+                with open(f"{model_path}.error", "w") as f:
+                    f.write(error_msg)
+            except:
+                pass
+
+        finally:
+            # Восстанавливаем оригинальные аргументы
+            sys.argv = original_argv
+            self.current_training -= 1
+
+    def force_retrain_all(self):
+        """Принудительное переобучение всех моделей"""
+        log_maker("🔄 Запуск принудительного переобучения всех моделей")
+        for coin in self.coin_list:
+            self.add_to_queue(coin, force_retrain=True)
+
+
+===== ./services/coin_selector.py =====
+import numpy as np
+from app.services.bybit_service import BybitService
+from app.utils.log_helper import log_maker
+from typing import Dict, List, Optional, Tuple
+import math
+import concurrent.futures
+import time
+
+class CoinSelector:
+    def __init__(self, coin_list: List[str]):
+        self.coin_list = coin_list
+        self.bybit = BybitService()
+        self.cache: Dict[str, dict] = {}
+        self.timeout = 25  # Увеличим таймаут до 25 секунд
+        self.max_workers = 4  # Оптимальное количество потоков
+        self.last_update = 0
+        self.update_interval = 3600  # Обновлять данные раз в час
+        
+    def calculate_volatility(self, closes: List[float]) -> float:
+        """Рассчитывает волатильность как стандартное отклонение процентных изменений"""
+        if len(closes) < 2:
+            return 0.0
+            
+        # Рассчитываем процентные изменения
+        returns = []
+        for i in range(1, len(closes)):
+            if closes[i-1] != 0:  # Защита от деления на ноль
+                ret = (closes[i] - closes[i-1]) / closes[i-1]
+                returns.append(ret)
+        
+        if len(returns) < 2:
+            return 0.0
+            
+        # Возвращаем стандартное отклонение в процентах
+        return np.std(returns) * 100
+        
+    def sigmoid_normalize(self, value: float, midpoint: float, steepness: float = 10) -> float:
+        """Нормализует значение через сигмоиду с защитой от переполнения"""
+        try:
+            x = steepness * (value - midpoint)
+            # Защита от слишком больших значений
+            if x > 100:
+                return 1.0
+            elif x < -100:
+                return 0.0
+            return 1 / (1 + math.exp(-x))
+        except:
+            return 0.5  # Возвращаем нейтральное значение при ошибке
+        
+    def calculate_metrics(self, symbol: str) -> Optional[dict]:
+        """Рассчитывает метрики для одной монеты с повторными попытками"""
+        for attempt in range(3):  # 3 попытки
+            try:
+                # Получаем свечи за последние 4 часа (15-минутные)
+                candles = self.bybit.get_candles(symbol, interval="15", limit=16)
+                
+                if not candles or len(candles) < 15:
+                    if attempt == 2:  # Последняя попытка
+                        log_maker(f"⚠️ Недостаточно данных для {symbol}")
+                        return None
+                    time.sleep(2)  # Пауза перед повторной попыткой
+                    continue
+                    
+                closes = [c['close'] for c in candles]
+                volumes = [c['volume'] for c in candles]
+                highs = [c['high'] for c in candles]
+                lows = [c['low'] for c in candles]
+                
+                # Рассчитываем показатели
+                volatility = self.calculate_volatility(closes)
+                
+                # Тренд (наклон линии регрессии)
+                x = np.arange(len(closes))
+                slope = np.polyfit(x, closes, 1)[0]
+                mean_price = np.mean(closes)
+                trend_strength = (slope / mean_price) * 100 if mean_price != 0 else 0
+                
+                # Отношение объема к среднему
+                if len(volumes) >= 5:
+                    avg_volume = np.mean(volumes[-5:])
+                    volume_ratio = volumes[-1] / avg_volume if avg_volume != 0 else 1.0
+                else:
+                    volume_ratio = 1.0
+                
+                # ATR (Average True Range)
+                atr = self._calculate_atr(highs, lows, closes)
+                
+                # Соотношение риск/прибыль (на основе ATR)
+                risk_reward = (atr / closes[-1]) * 100 if closes[-1] != 0 else 0
+                
+                return {
+                    'volatility': volatility,
+                    'trend_strength': trend_strength,
+                    'volume_ratio': volume_ratio,
+                    'risk_reward': risk_reward,
+                    'price': closes[-1],
+                    'atr': atr
+                }
+                
+            except Exception as e:
+                if attempt == 2:  # Последняя попытка
+                    log_maker(f"🔥 Ошибка расчета метрик для {symbol}: {str(e)}")
+                    return None
+                time.sleep(1)  # Пауза перед повторной попыткой
+    
+    def _calculate_atr(self, highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+        """Расчет Average True Range"""
+        if len(highs) < period or len(closes) < 2:
+            return 0.0
+        
+        tr_values = []
+        for i in range(1, len(highs)):
+            tr1 = highs[i] - lows[i]
+            tr2 = abs(highs[i] - closes[i-1])
+            tr3 = abs(lows[i] - closes[i-1])
+            tr = max(tr1, tr2, tr3)
+            tr_values.append(tr)
+        
+        return np.mean(tr_values[-period:]) if tr_values else 0.0
+    
+    def evaluate_coins(self) -> List[Tuple[str, float]]:
+        """Оценивает все монеты с использованием параллельных запросов"""
+        # Используем кэш, если данные не устарели
+        current_time = time.time()
+        if current_time - self.last_update < self.update_interval:
+            return self._get_cached_scores()
+        
+        scores = []
+        self.cache = {}  # Очищаем кэш перед обновлением
+        
+        # Используем ThreadPoolExecutor для параллельных запросов
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_coin = {
+                executor.submit(self._evaluate_coin, coin): coin
+                for coin in self.coin_list
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_coin, timeout=self.timeout):
+                coin = future_to_coin[future]
+                try:
+                    # Добавляем таймаут для каждого future
+                    result = future.result(timeout=15)
+                    if result:
+                        scores.append(result)
+                except Exception as e:
+                    # Логируем только серьезные ошибки
+                    if "Not supported symbols" not in str(e):
+                        log_maker(f"⚠️ Ошибка оценки {coin}: {str(e)}")
+                    else:
+                        # Для "Not supported symbols" просто возвращаем 0 оценку
+                        scores.append((coin, 0.0))
+        
+        # Сортируем по убыванию оценки
+        scores.sort(key=lambda x: x[1], reverse=True)
+        self.last_update = current_time
+        return scores
+    
+    def _get_cached_scores(self) -> List[Tuple[str, float]]:
+        """Возвращает оценки из кэша"""
+        scores = []
+        for coin in self.coin_list:
+            if coin in self.cache:
+                scores.append((coin, self.cache[coin]['score']))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores
+    
+    def _evaluate_coin(self, coin: str) -> Optional[Tuple[str, float]]:
+        """Внутренний метод для оценки одной монеты"""
+        symbol = f"{coin}USDT"
+        metrics = self.calculate_metrics(symbol)
+        
+        if not metrics:
+            return None
+            
+        # Весовые коэффициенты
+        weights = {
+            'volatility': 0.4,
+            'trend_strength': 0.3,
+            'volume_ratio': 0.2,
+            'risk_reward': 0.1
+        }
+        
+        # Нормализация значений через сигмоиду
+        normalized = {
+            'volatility': self.sigmoid_normalize(metrics['volatility'], 1.0),
+            'trend_strength': self.sigmoid_normalize(metrics['trend_strength'], 0.5),
+            'volume_ratio': min(max(metrics['volume_ratio'], 0.5), 3.0) / 3.0,
+            'risk_reward': self.sigmoid_normalize(metrics['risk_reward'], 1.0)
+        }
+        
+        # Рассчет итоговой оценки
+        score = sum(normalized[k] * weights[k] for k in weights)
+        
+        # Кэшируем результаты
+        self.cache[coin] = {
+            'metrics': metrics,
+            'score': score,
+            'normalized': normalized,
+            'timestamp': time.time()
+        }
+        
+        return (coin, score)
+    
+    def get_best_coin(self) -> Optional[str]:
+        """Возвращает лучшую монету для торговли"""
+        scores = self.evaluate_coins()
+        if not scores:
+            return None
+        return scores[0][0]
+    
+    def get_coin_report(self, coin: str) -> Optional[dict]:
+        """Возвращает детальный отчет по монете"""
+        return self.cache.get(coin)
+
+===== ./services/__init__.py =====
+from .coin_ranker import CoinRanker
+from .coin_rotator import CoinRotator
+from .coin_selector import CoinSelector
+from .model_trainer import ModelTrainer
+from .bybit_service import BybitService
+from .bot_runner import TradingBot
+
+
+
+__all__ = [
+    'CoinRanker', 
+    'CoinRotator', 
+    'CoinSelector', 
+    'ModelTrainer', 
+    'BybitService', 
+    'TradingBot'
+]
+
+===== ./services/trading_system.py =====
+import os
+import json
+import time
+from app.services.coin_ranker import CoinRanker
+from app.services.model_trainer import ModelTrainer
+from app.services.bybit_service import BybitService
+from app.strategies.ma_crossover import MovingAverageStrategy
+from app.strategies.neural_strategy import NeuralStrategy
+from app.utils.log_helper import log_maker
+from app.services.coin_rotator import CoinRotator
+
+class TradingSystem:
+    def __init__(self, coin_list):
+        self.coin_list = coin_list
+        self.state = self.load_state()
+        self.bybit = BybitService()
+        self.ranker = CoinRanker()
+        self.model_trainer = ModelTrainer(coin_list)
+        self.rotator = CoinRotator(coin_list, trading_system=self)
+        self.position_open_time = self.state.get("position_open_time", 0)
+        self.position_coin = self.state.get("position_coin", "")
+        self.max_hold_hours = 24
+        
+        # Инициализация системы
+        self.ranker.add_new_coins(coin_list)
+        self.current_coin = self.state.get("current_coin", coin_list[0])
+        self.current_symbol = f"{self.current_coin}USDT"
+        self._init_strategy()  # Вызываем инициализацию стратегии
+        
+        # Автоматическое обучение моделей при запуске
+        self.train_missing_models()
+        self.model_trainer.start_periodic_retraining()
+        
+        log_maker(f"⚙️ Торговая система инициализирована. Текущая монета: {self.current_coin}")
+    
+    def train_missing_models(self):
+        """Обучение моделей для монет, у которых они отсутствуют"""
+        for coin in self.coin_list:
+            model_path = f"models/{coin}_neural_model.keras"
+            if not os.path.exists(model_path):
+                log_maker(f"🧠 Модель для {coin} отсутствует. Добавляю в очередь обучения.")
+                self.model_trainer.add_to_queue(coin, force_retrain=True)
+    
+    def load_state(self):
+        try:
+            with open("bot_state.json", "r") as f:
+                return json.load(f)
+        except:
+            return {"current_coin": self.coin_list[0]}
+
+    def save_state(self):
+        """Сохраняет текущее состояние системы"""
+        self.state = {
+            "current_coin": self.current_coin,
+            "position_open_time": self.position_open_time,
+            "position_coin": self.position_coin
+        }
+        with open("bot_state.json", "w") as f:
+            json.dump(self.state, f, indent=2)
+
+    def _init_strategy(self):
+        """Инициализирует стратегию с автоматическим выбором типа"""
+        # Формируем символ и путь к модели
+        symbol = f"{self.current_coin}USDT"
+        model_base = f"models/{self.current_coin}_neural_model"
+        model_file = f"{model_base}.keras"
+        
+        try:
+            # Пытаемся использовать нейросетевую стратегию, если модель доступна
+            if os.path.exists(model_file):
+                self.strategy = NeuralStrategy(
+                    symbol, 
+                    bybit_service=self.bybit,
+                    model_path=model_base,
+                    rotator=self.rotator,
+                    trading_system=self
+                )
+                log_maker(f"🧠 Используется нейросетевая стратегия для {symbol}")
+            else:
+                # Fallback на MA стратегию
+                log_maker(f"🔄 Модель для {symbol} не найдена. Использую MA стратегию")
+                self.strategy = MovingAverageStrategy(
+                    symbol, 
+                    "3", 
+                    rotator=self.rotator,
+                    trading_system=self
+                )
+                
+                # Запускаем обучение модели в фоне
+                self.model_trainer.add_to_queue(self.current_coin, force_retrain=True)
+        except Exception as e:
+            # Двойной fallback на случай ошибки инициализации
+            log_maker(f"🔥 Ошибка инициализации стратегии: {e}. Использую базовую MA.")
+            self.strategy = MovingAverageStrategy(
+                symbol, 
+                "3", 
+                rotator=self.rotator,
+                trading_system=self
+            )
+    
+    def health_check(self):
+        return {
+            "current_coin": self.current_coin,
+            "position_open": self.position_open_time > 0,
+            "position_hours": (time.time() - self.position_open_time) / 3600 if self.position_open_time else 0
+        }
+
+    def start(self):
+        log_maker("🚀 Система торговли запущена")
+
+    def stop(self):
+        log_maker("🛑 Система торговли остановлена")
+
+    def switch_coin(self, new_coin: str):
+        """Переключает торгуемую монету"""
+        self.current_coin = new_coin
+        self.current_symbol = f"{new_coin}USDT"  # Обновляем символ
+        self.save_state()
+        self._init_strategy()
+
+    def check_force_close(self) -> bool:
+        """Проверяет необходимость принудительного закрытия позиции"""
+        if self.position_open_time == 0:
+            return False
+            
+        # Рассчитываем время удержания в часах
+        hold_hours = (time.time() - self.position_open_time) / 3600
+        return hold_hours >= self.max_hold_hours
+
+===== ./utils/log_helper.py =====
+from app.notifier import send_telegram_message
+
+
+def log_maker(message: str, buy_sell: bool = False):
+    print(message)
+    send_telegram_message(message, buy_sell=buy_sell)
+
+def log_error(message: str):
+    """Логирует критические ошибки"""
+    error_message = f"🔥 [CRITICAL] {message}"
+    print(error_message)
+    send_telegram_message(error_message, buy_sell=True)
+
+===== ./utils/place_order.py =====
+import json
+import os
+from datetime import datetime, timezone
+from app.utils.log_helper import log_maker
+from pybit.unified_trading import HTTP
+
+
+LOG_PATH = "logs/order_failures.json"
+
+
+def log_order_failure(context: dict):
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    log_entry = {"timestamp": datetime.now(timezone.utc).isoformat(), **context}
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
+
+def safe_place_order(
+    client: HTTP,
+    symbol: str,
+    side: str,
+    qty: str,
+    order_type: str = "Market",
+    category: str = "spot",
+) -> dict | None:
+    payload = {
+        "category": category,
+        "symbol": symbol,
+        "side": side.upper(),
+        "order_type": order_type,
+        "qty": qty,
+    }
+
+    # Попытка №1 — с accountType="UNIFIED"
+    try:
+        log_maker("🛠️ [TRY] Пробуем ордер с accountType='UNIFIED'")
+        response = client.place_order(**payload, accountType="UNIFIED")
+        if response["retCode"] == 0:
+            log_maker("✅ [SUCCESS] Ордер успешно размещён с accountType='UNIFIED'")
+            return response
+        log_maker(
+            f"❌ [FAILURE] Ошибка размещения ордера: retCode {response['retCode']} — {response['retMsg']}"
+        )
+    except Exception as e:
+        log_maker(f"🚨 [ERROR] Исключение при попытке ордера с accountType='UNIFIED': {e}")
+
+        log_order_failure(
+            {
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "category": category,
+                "accountType": "UNIFIED",
+                "error": str(e),
+            }
+        )
+
+    # Попытка №2 — без accountType
+    try:
+        log_maker("🛠️ [TRY] Пробуем ордер *без* accountType")
+        response = client.place_order(**payload)
+        if response["retCode"] == 0:
+            log_maker("✅ [SUCCESS] Ордер успешно размещён *без* accountType")
+            return response
+        log_maker(
+            f"❌ [FAILURE] Ошибка размещения ордера: retCode {response['retCode']} — {response['retMsg']}"
+        )
+    except Exception as e:
+        log_maker(f"🚨 [ERROR] Исключение при размещении *без* accountType: {e}")
+        log_order_failure(
+            {
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "category": category,
+                "accountType": "UNSPECIFIED",
+                "error": str(e),
+            }
+        )
+
+    return None
+
+
+===== ./utils/coin_loader.py =====
+# ./utils/coin_loader.py
+def load_coin_list(file_path: str) -> list:
+    try:
+        with open(file_path, 'r') as f:
+            return [line.strip().upper() for line in f if line.strip()]
+    except:
+        return ["SOL", "BTC", "ETH"]  # Default coins
+
+===== ./utils/get_history.py =====
+import requests
+import pandas as pd
+import json
+
+def fetch_bybit_ohlcv_15m(symbol="SOLUSDT", category="spot"):
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": category,
+        "symbol": symbol,
+        "interval": "15m",
+        "limit": 96
+    }
+
+    response = requests.get(url, params=params)
+    data = response.json()
+
+    if data["retCode"] != 0:
+        raise Exception(f"API error: {data['retMsg']}")
+
+    raw = data["result"]["list"]
+
+    if not raw:
+        print("❌ No data returned. Check symbol and category.")
+        return pd.DataFrame()
+
+    # Сохраняем в файл (в порядке по убыванию времени)
+    with open(f"ohlcv_{symbol}.json", "w") as f:
+        json.dump(raw, f, indent=2)
+
+    # Парсинг и сортировка по времени (по возрастанию)
+    df = pd.DataFrame(raw, columns=[
+        "timestamp", "open", "high", "low", "close", "volume", "_1", "_2"
+    ])
+
+    df = df.astype({
+        "timestamp": "int64",
+        "open": "float",
+        "high": "float",
+        "low": "float",
+        "close": "float",
+        "volume": "float"
+    })
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    return df
+
+# 🧪 Пример запуска
+if __name__ == "__main__":
+    df = fetch_bybit_ohlcv_15m("SOLUSDT", "spot")
+    if not df.empty:
+        print(df.tail())
+
+
+===== ./utils/trading_utils.py =====
+from decimal import ROUND_DOWN, Decimal
+
+def round_qty(qty: float, precision: int) -> float:
+    quantize_str = "1" if precision == 0 else "1." + "0" * precision
+    return float(Decimal(str(qty)).quantize(Decimal(quantize_str), rounding=ROUND_DOWN))
+
+===== ./utils/get_profit.py =====
+import time
+import hmac
+import hashlib
+import requests
+from datetime import datetime, timedelta
+import urllib.parse
+
+class ProfitCalculator:
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = "https://api.bybit.com"
+        self.recv_window = "5000"
+
+    def _generate_signature(self, params):
+        timestamp = str(int(time.time() * 1000))
+        encoded_params = urllib.parse.urlencode(params, doseq=True)
+        sign_str = timestamp + self.api_key + self.recv_window + encoded_params
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            sign_str.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        return timestamp, signature
+
+    def get_balance_history(self, days=1, coin="USDT", account_type="UNIFIED", limit=50):
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        
+        params = {
+            "accountType": account_type,
+            "startTime": start_time,
+            "endTime": end_time,
+            "limit": limit,
+            "coin": coin
+        }
+        
+        timestamp, signature = self._generate_signature(params)
+        
+        headers = {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-RECV-WINDOW": self.recv_window,
+        }
+        
+        endpoint = "/v5/account/transaction-log"
+        url = f"{self.base_url}{endpoint}"
+        response = requests.get(url, params=params, headers=headers)
+        
+        return response.json()
+
+    def calculate_profit(self, history):
+        if not history or history.get("retCode") != 0:
+            return 0.0, 0.0
+
+        transactions = history.get("result", {}).get("list", [])
+        today = datetime.now().date()
+        month_start = today.replace(day=1)
+        
+        profit_today = 0.0
+        profit_month = 0.0
+        
+        for tx in transactions:
+            if tx.get("currency") == "USDT" and tx.get("type") == "TRADE":
+                tx_time = int(tx.get("transactionTime", 0)) / 1000
+                if tx_time == 0:
+                    continue
+                    
+                tx_date = datetime.fromtimestamp(tx_time).date()
+                change = float(tx.get("change", 0))
+                
+                # Учитываем комиссию
+                if tx.get("fee") and tx["fee"] != "0":
+                    fee = float(tx["fee"])
+                    change -= fee
+                    
+                profit_month += change
+                if tx_date == today:
+                    profit_today += change
+                    
+        return profit_today, profit_month
+
+===== ./utils/symbol_selector.py =====
+# app/services/symbol_selector.py
+import numpy as np
+from app.services.bybit_service import BybitService
+from app.strategies.ma_crossover import MovingAverageStrategy
+from app.utils.log_helper import log_maker
+
+class SymbolSelector:
+    def __init__(self, symbols: list, volatility_window: int = 24):
+        self.symbols = symbols
+        self.window = volatility_window
+        self.bybit = BybitService()
+        self.strategies = {s: MovingAverageStrategy(s) for s in symbols}
+        self.scores = {}  # Для хранения текущих баллов
+        
+    def calculate_volatility_score(self, symbol: str) -> float:
+        """Оценка привлекательности монеты 0-100 баллов"""
+        candles = self.bybit.get_candles(symbol, "60", limit=self.window)
+        if not candles:
+            return 0
+            
+        # 1. Историческая волатильность
+        closes = [c['close'] for c in candles]
+        if len(closes) < 2:
+            return 0
+            
+        returns = np.diff(np.log(closes))
+        volatility = np.std(returns) * 100 if returns else 0
+        
+        # 2. Объемы
+        volumes = [c['volume'] for c in candles[-6:]]
+        if not volumes:
+            volume_ratio = 1
+        else:
+            min_vol = min(volumes) if min(volumes) > 0 else 1
+            volume_ratio = max(volumes) / min_vol
+        
+        # 3. Текущий тренд (EMA slope)
+        try:
+            strategy = self.strategies[symbol]
+            strategy.should_trade(candles)  # обновляем состояние EMA
+            if strategy.prev_medium_ema and strategy.prev_medium_ema > 0:
+                slope = (strategy.prev_short_ema - strategy.prev_medium_ema) / strategy.prev_medium_ema
+            else:
+                slope = 0
+        except Exception as e:
+            log_maker(f"⚠️ Ошибка расчета тренда для {symbol}: {e}")
+            slope = 0
+        
+        # Композитный балл
+        return (volatility * 70) + (volume_ratio * 20) + (abs(slope) * 1000 * 10)
+
+    def select_best_symbol(self, current_symbol: str = None):
+        """Выбор символа с повышающим коэффициентом для текущего"""
+        scores = {}
+        for symbol in self.symbols:
+            try:
+                score = self.calculate_volatility_score(symbol)
+                
+                # Повышаем бал текущего символа на 10%
+                if symbol == current_symbol:
+                    score *= 1.1
+                    
+                scores[symbol] = score
+            except Exception as e:
+                log_maker(f"⚠️ Ошибка оценки {symbol}: {e}")
+                scores[symbol] = 0
+        
+        self.scores = scores  # Сохраняем для использования в боте
+        best_symbol = max(scores, key=scores.get)
+        return best_symbol, scores[best_symbol]
+
+===== ./utils/__init__.py =====
+from .coin_loader import load_coin_list
+from .get_profit import ProfitCalculator
+from .log_helper import log_maker
+from .place_order import log_order_failure, safe_place_order
+from .trading_utils import round_qty
+from .get_history import fetch_bybit_ohlcv_15m
+
+__all__ = [
+    'load_coin_list',
+    'ProfitCalculator',
+    'log_maker',
+    'log_order_failure',
+    'safe_place_order',
+    'round_qty',
+    'fetch_bybit_ohlcv_15m'
+]
+
+
+===== ./utils/candle_sync.py =====
+import time
+import math
+
+
+class CandleSynchronizer:
+    def __init__(self, interval_minutes: int = 5):
+        self.interval_seconds = interval_minutes * 60
+
+    def get_next_execution_time(self):
+        current_time = time.time()
+        next_candle = (
+            math.ceil(current_time / self.interval_seconds) * self.interval_seconds
+        )
+        return next_candle
+
+    def time_until_next_execution(self):
+        return self.get_next_execution_time() - time.time()
+
+    def sync(self):
+        sleep_time = self.time_until_next_execution()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+    def time_until_next_candle(self):  # <-- Добавьте этот метод
+        """Возвращает количество секунд до начала следующей свечи"""
+        current_time = time.time()
+        next_candle_start = math.ceil(current_time / self.interval_seconds) * self.interval_seconds
+        return next_candle_start - current_time
+        
+    def sync(self):
+        """Ожидает начала следующей свечи"""
+        sleep_time = self.time_until_next_candle()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+===== ../run_bot.py (добавлено отдельно) =====
+#!/usr/bin/env python3
+import logging
+import time
+import traceback
+import os
+from app.services.bot_controller import bot_controller
+from app.utils import load_coin_list
+from app.services.trading_system import TradingSystem
+from app.trading.order_executor import OrderExecutor
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("logs/bot_system.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('main')
+
+def setup_directories():
+    """Создает необходимые директории"""
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+
+def main():
+    logger.info("🚀 Запуск торговой системы...")
+    setup_directories()
+    
+    coin_list = load_coin_list("coins_list.txt")
+    logger.info(f"📋 Загружено монет: {len(coin_list)}")
+    
+    trading_system = TradingSystem(coin_list=coin_list)
+    trading_system.start()
+    
+    # Проверяем есть ли открытая позиция
+    position_coin = trading_system.state.get("position_coin", "")
+    if position_coin:
+        trading_system.current_coin = position_coin
+        trading_system.rotator.set_current_coin(position_coin)
+        logger.info(f"⏪ Возвращаемся к открытой позиции: {position_coin}")
+    
+    
+    logger.info(f"🏁 Начальная монета: {trading_system.current_coin}")
+
+    bot_controller.start()
+    logger.info("🤖 Торговый бот запущен")
+    
+    try:
+        logger.info("🔄 Вход в основной цикл управления")
+        last_health_check = time.time()
+        while True:
+            # Проверяем состояние бота
+            if bot_controller.status() != "running":
+                logger.error("⚠️ Бот остановлен! Перезапускаем...")
+                bot_controller.start()
+            
+            # Ротация монет только если нет открытой позиции
+            if not trading_system.position_open_time:
+                try:
+                    current_coin = trading_system.rotator.rotate_coins()
+                    if current_coin != trading_system.current_coin:
+                        logger.info(f"🔄 Переключаем монету с {trading_system.current_coin} на {current_coin}")
+                        
+                        # Принудительно очищаем остатки предыдущей монеты
+                        prev_symbol = f"{trading_system.current_coin}USDT"
+                        executor = OrderExecutor(prev_symbol)
+                        executor.clean_residuals(threshold=0.0001)
+                        
+                        trading_system.switch_coin(current_coin)
+                        bot_controller.switch_coin(current_coin)
+                except Exception as e:
+                    logger.error(f"⚠️ Ошибка при ротации монет: {e}")
+            
+            # Проверка на принудительное закрытие позиции
+            try:
+                if trading_system.position_open_time:
+                    symbol = f"{trading_system.current_coin}USDT"
+                    logger.info(f"⏱️ Проверка принудительного закрытия позиции для {symbol}")
+                    
+                    # Проверяем есть ли реальная позиция
+                    positions = trading_system.bybit.get_open_positions()
+                    position_exists = any(
+                        pos['coin'] == trading_system.current_coin 
+                        for pos in positions
+                    )
+                    
+                    if position_exists:
+                        executor = OrderExecutor(symbol)
+                        if executor.execute_force_close():
+                            trading_system.position_open_time = 0
+                            logger.info("✅ Позиция успешно закрыта")
+                        else:
+                            logger.warning("⚠️ Не удалось закрыть позицию принудительно")
+                    else:
+                        logger.info("⏩ Нет открытой позиции, сбрасываем флаг")
+                        trading_system.position_open_time = 0
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка при проверке принудительного закрытия: {e}")
+            
+            # Health check
+            if time.time() - last_health_check > 3600:
+                logger.info("🩺 Health check:")
+                logger.info(f"Bot status: {bot_controller.status()}")
+                last_health_check = time.time()
+            
+            # Ожидание перед следующей проверкой
+            time.sleep(60)
+            
+    except KeyboardInterrupt:
+        logger.info("🛑 Получен сигнал KeyboardInterrupt")
+    except Exception as e:
+        logger.error(f"💥 Критическая ошибка: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info("⏹️ Завершение работы системы...")
+        bot_controller.stop()
+        trading_system.stop()
+        logger.info("✅ Система остановлена корректно")
+
+if __name__ == "__main__":
+    main()
+
+===== Структура проекта (tree из ../) =====
+../
+├── alembic.ini
+├── amvera.yml
+├── app
+│   ├── api
+│   │   └── routes
+│   │       ├── bot_control.py
+│   │       ├── __init__.py
+│   │       └── trade_log.py
+│   ├── config.py
+│   ├── indicators
+│   │   └── market_grades.py
+│   ├── __init__.py
+│   ├── notifier.py
+│   ├── output.txt
+│   ├── save_all_files.sh
+│   ├── services
+│   │   ├── bot_controller.py
+│   │   ├── bot_runner.py
+│   │   ├── bybit_service.py
+│   │   ├── bybit_sync.py
+│   │   ├── coin_ranker.py
+│   │   ├── coin_rotator.py
+│   │   ├── coin_selector.py
+│   │   ├── __init__.py
+│   │   ├── model_trainer.py
+│   │   └── trading_system.py
+│   ├── strategies
+│   │   ├── balance_snapshots.json
+│   │   ├── base.py
+│   │   ├── __init__.py
+│   │   ├── ma_crossover.py
+│   │   ├── neural_network
+│   │   │   ├── __init__.py
+│   │   │   ├── model.py
+│   │   │   └── trainer.py
+│   │   └── neural_strategy.py
+│   ├── trader.py
+│   ├── trading
+│   │   ├── data_provider.py
+│   │   ├── __init__.py
+│   │   └── order_executor.py
+│   └── utils
+│       ├── candle_sync.py
+│       ├── coin_loader.py
+│       ├── get_history.py
+│       ├── get_profit.py
+│       ├── __init__.py
+│       ├── log_helper.py
+│       ├── place_order.py
+│       ├── symbol_selector.py
+│       └── trading_utils.py
+├── bot.db
+├── bot_state.json
+├── check_models.py
+├── coins_list.txt
+├── data
+│   └── coin_ranking.json
+├── get_balance_history.py
+├── last_filled_orders_full.json
+├── logs
+│   └── bot_system.log
+├── main.py
+├── models
+│   ├── ADA_neural_model.config
+│   ├── ADA_neural_model.keras
+│   ├── ADA_neural_model_scaler.npz
+│   ├── ALGO_neural_model.config
+│   ├── ALGO_neural_model.keras
+│   ├── ALGO_neural_model_scaler.npz
+│   ├── APE_neural_model.config
+│   ├── APE_neural_model.keras
+│   ├── APE_neural_model_scaler.npz
+│   ├── APT_neural_model.config
+│   ├── APT_neural_model.keras
+│   ├── APT_neural_model_scaler.npz
+│   ├── ARB_neural_model.config
+│   ├── ARB_neural_model.keras
+│   ├── ARB_neural_model_scaler.npz
+│   ├── ARKM_neural_model.config
+│   ├── ARKM_neural_model.keras
+│   ├── ARKM_neural_model_scaler.npz
+│   ├── AVAX_neural_model.config
+│   ├── AVAX_neural_model.keras
+│   ├── AVAX_neural_model_scaler.npz
+│   ├── BEAM_neural_model.config
+│   ├── BEAM_neural_model.keras
+│   ├── BEAM_neural_model_scaler.npz
+│   ├── CHZ_neural_model.config
+│   ├── CHZ_neural_model.keras
+│   ├── CHZ_neural_model_scaler.npz
+│   ├── DOGE_neural_model.config
+│   ├── DOGE_neural_model.keras
+│   ├── DOGE_neural_model_scaler.npz
+│   ├── FET_neural_model.config
+│   ├── FET_neural_model.keras
+│   ├── FET_neural_model_scaler.npz
+│   ├── GRT_neural_model.config
+│   ├── GRT_neural_model.keras
+│   ├── GRT_neural_model_scaler.npz
+│   ├── HBAR_neural_model.config
+│   ├── HBAR_neural_model.keras
+│   ├── HBAR_neural_model_scaler.npz
+│   ├── JASMY_neural_model.config
+│   ├── JASMY_neural_model.keras
+│   ├── JASMY_neural_model_scaler.npz
+│   ├── KAIA_neural_model.config
+│   ├── KAIA_neural_model.keras
+│   ├── KAIA_neural_model_scaler.npz
+│   ├── KAS_neural_model.config
+│   ├── KAS_neural_model.keras
+│   ├── KAS_neural_model_scaler.npz
+│   ├── NEAR_neural_model.config
+│   ├── NEAR_neural_model.keras
+│   ├── NEAR_neural_model_scaler.npz
+│   ├── OP_neural_model.config
+│   ├── OP_neural_model.keras
+│   ├── OP_neural_model_scaler.npz
+│   ├── POL_neural_model.config
+│   ├── POL_neural_model.keras
+│   ├── POL_neural_model_scaler.npz
+│   ├── PYTH_neural_model.config
+│   ├── PYTH_neural_model.keras
+│   ├── PYTH_neural_model_scaler.npz
+│   ├── SAND_neural_model.config
+│   ├── SAND_neural_model.keras
+│   ├── SAND_neural_model_scaler.npz
+│   ├── SOL_neural_model.config
+│   ├── SOL_neural_model.keras
+│   ├── SOL_neural_model_scaler.npz
+│   ├── STX_neural_model.config
+│   ├── STX_neural_model.keras
+│   ├── STX_neural_model_scaler.npz
+│   ├── SUI_neural_model.config
+│   ├── SUI_neural_model.keras
+│   ├── SUI_neural_model_scaler.npz
+│   ├── TRX_neural_model.config
+│   ├── TRX_neural_model.keras
+│   ├── TRX_neural_model_scaler.npz
+│   ├── WLD_neural_model.config
+│   ├── WLD_neural_model.keras
+│   ├── WLD_neural_model_scaler.npz
+│   ├── XLM_neural_model.config
+│   ├── XLM_neural_model.keras
+│   ├── XLM_neural_model_scaler.npz
+│   ├── XRP_neural_model.config
+│   ├── XRP_neural_model.keras
+│   ├── XRP_neural_model_scaler.npz
+│   ├── ZIG_neural_model.config
+│   ├── ZIG_neural_model.keras
+│   ├── ZIG_neural_model_scaler.npz
+│   ├── ZK_neural_model.config
+│   ├── ZK_neural_model.keras
+│   └── ZK_neural_model_scaler.npz
+├── package.json
+├── package-lock.json
+├── pytest.ini
+├── pytest.log
+├── requirements_all.txt
+├── requirements.txt
+├── run_bot.py
+├── run_func.py
+├── test_result.txt
+├── tests
+│   ├── __init__.py
+│   ├── test_candels_requwst.py
+│   ├── test_coin_selector.py
+│   ├── test_coin_selector_real.py
+│   └── test_model.py
+└── tree.txt
+
+14 directories, 156 files
